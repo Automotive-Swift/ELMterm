@@ -130,24 +130,55 @@ ELMterm tcp://192.168.0.10:35000
 ### Command-Line Options
 
 ```
-USAGE: ELMterm <url> [--annotation-disabled]
+USAGE: ELMterm <url>
 
 ARGUMENTS:
   <url>                   Connection URL (tty://dummy:BAUDRATE/PATH or tcp://HOST:PORT)
 
 OPTIONS:
-  --annotation-disabled   Disable protocol annotations
-  -h, --help              Show help information
+  -t, --timeout <seconds> Connection timeout (default 12s)
+  -p, --prompt <text>     Prompt shown in the REPL (default "> ")
+  --terminator <mode>     Append CR/LF/CRLF/none/hex:... or literal text to every command
+  --history <path>        Persist command history at this path (default ~/.elmterm.history)
+  --history-depth <n>     Maximum commands retained in history (default 500)
+  --config <path>         Load JSON preferences (default ~/.elmterm.json when present)
+  --theme <preset>        Force color theme (light or dark)
+  --hexdump               Print incoming frames as ASCII + hexdump
+  --plain                 Disable analyzer/annotation pipeline
+  --timestamps            Prefix RX/TX lines with ISO8601 timestamps
+  -h, --help              Show full help information
 ```
+
+### Configuration & Theming
+
+ELMterm can read persistent preferences from a JSON file. By default it looks for `~/.elmterm.json`, or you can point to another path with `--config /path/to/file.json`. CLI flags always win over config values.
+
+Supported keys:
+
+```json
+{
+  "theme": "dark",
+  "historyPath": "/Users/you/.elmterm.history",
+  "historyDepth": 1000
+}
+```
+
+- `theme`: chooses between `light` (optimized for beige/yellow terminals) and `dark` palettes. You can also override per run via `--theme`.
+- `historyPath`: custom location for persistent command history; defaults to `~/.elmterm.history`.
+- `historyDepth`: cap on stored commands; defaults to `500`.
+
+History now writes to disk after every command, so abrupt exits won’t drop recent entries.
 
 ### Meta Commands
 
 ELMterm supports meta commands prefixed with `:`:
 
 - `:help` - Display help information
-- `:quit` - Exit the terminal
-- `:history` - Show command history
-- `:annotations on|off` - Toggle protocol annotations
+- `:history [n]` - Show the last `n` commands (default 20)
+- `:clear` - Clear the terminal
+- `:analyzer [on|off]` - Toggle protocol annotations or force a state
+- `:save` - Persist in-memory history immediately
+- `:quit` (or `:exit`) - Leave the terminal
 
 ### Example Session
 
