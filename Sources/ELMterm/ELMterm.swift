@@ -2,6 +2,61 @@ import ArgumentParser
 import CornucopiaStreams
 import Foundation
 
+enum ColorTheme: String, CaseIterable, Codable, ExpressibleByArgument {
+
+    case light
+    case dark
+
+    init?(argument: String) {
+        self.init(rawValue: argument.lowercased())
+    }
+}
+
+struct ColorPalette {
+    let outgoing: String
+    let incoming: String
+    let status: String
+    let annotationOutgoing: String
+    let annotationIncoming: String
+    let hexdump: String
+    let error: String
+
+    static let reset = "\u{001B}[0m"
+
+    static func palette(for theme: ColorTheme) -> ColorPalette {
+        switch theme {
+            case .light:
+                return ColorPalette(
+                    outgoing: "\u{001B}[38;5;19m",          // deep navy
+                    incoming: "\u{001B}[38;5;28m",         // dark green
+                    status: "\u{001B}[38;5;130m",          // burnt amber
+                    annotationOutgoing: "\u{001B}[38;5;24m",
+                    annotationIncoming: "\u{001B}[38;5;58m",
+                    hexdump: "\u{001B}[38;5;94m",
+                    error: "\u{001B}[38;5;124m"
+                )
+            case .dark:
+                return ColorPalette(
+                    outgoing: "\u{001B}[38;5;117m",        // bright cyan
+                    incoming: "\u{001B}[38;5;156m",        // pale green
+                    status: "\u{001B}[38;5;222m",          // warm yellow
+                    annotationOutgoing: "\u{001B}[38;5;153m",
+                    annotationIncoming: "\u{001B}[38;5;186m",
+                    hexdump: "\u{001B}[38;5;244m",
+                    error: "\u{001B}[38;5;203m"
+                )
+        }
+    }
+}
+
+struct UserPreferences: Codable {
+    var theme: ColorTheme?
+    var historyPath: String?
+    var historyDepth: Int?
+
+    static let empty = UserPreferences(theme: nil, historyPath: nil, historyDepth: nil)
+}
+
 @main
 struct ELMterm: AsyncParsableCommand {
 
@@ -28,6 +83,12 @@ struct ELMterm: AsyncParsableCommand {
     @Option(name: .long, help: "Maximum number of commands kept in history.")
     var historyDepth: Int = 500
 
+    @Option(name: .long, help: "Path to a JSON config file (default: ~/.elmterm.json when present).")
+    var config: String?
+
+    @Option(name: .long, help: "Color theme preset (light or dark).")
+    var theme: ColorTheme?
+
     @Flag(name: .long, help: "Print incoming frames as ASCII + hexdump.")
     var hexdump: Bool = false
 
@@ -45,22 +106,21 @@ struct ELMterm: AsyncParsableCommand {
 
         signal(SIGPIPE, SIG_IGN)
 
-        let historyURL: URL?
-        if let history {
-            historyURL = URL(fileURLWithPath: history).standardizedFileURL
-        } else {
-            let defaultPath = ("~/.elmterm.history" as NSString).expandingTildeInPath
-            historyURL = URL(fileURLWithPath: defaultPath).standardizedFileURL
-        }
+        let preferences = self.loadPreferences()
+        let effectiveTheme = self.theme ?? preferences.theme ?? .light
+        let palette = ColorPalette.palette(for: effectiveTheme)
+        let historyURL = Self.makeHistoryURL(from: self.history ?? preferences.historyPath)
+        let historyDepth = preferences.historyDepth ?? self.historyDepth
 
         let configuration = TerminalConfiguration(
             prompt: self.prompt,
             terminator: self.terminator,
             historyURL: historyURL,
-            historyDepth: self.historyDepth,
+            historyDepth: historyDepth,
             hexdump: self.hexdump,
             timestamps: self.timestamps,
-            annotationIndent: 2
+            annotationIndent: 2,
+            colorPalette: palette
         )
 
         let controller = TerminalController(configuration: configuration, analyzer: self.plain ? nil : OBD2Analyzer())
@@ -90,6 +150,42 @@ struct ELMterm: AsyncParsableCommand {
                 throw error
         }
     }
+
+    private func loadPreferences() -> UserPreferences {
+        guard let configURL = self.resolveConfigURL() else { return .empty }
+        do {
+            let data = try Data(contentsOf: configURL)
+            return try JSONDecoder().decode(UserPreferences.self, from: data)
+        } catch {
+            fputs("Warning: Unable to load config at \(configURL.path): \(error.localizedDescription)\n", stderr)
+            return .empty
+        }
+    }
+
+    private func resolveConfigURL() -> URL? {
+        if let explicit = self.config?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+            let expanded = Self.expandPath(explicit)
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        let defaultPath = Self.expandPath("~/.elmterm.json")
+        guard FileManager.default.fileExists(atPath: defaultPath) else { return nil }
+        return URL(fileURLWithPath: defaultPath).standardizedFileURL
+    }
+
+    private static func expandPath(_ path: String) -> String {
+        (path as NSString).expandingTildeInPath
+    }
+
+    private static func makeHistoryURL(from path: String?) -> URL? {
+        let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPath: String
+        if let trimmed, !trimmed.isEmpty {
+            resolvedPath = Self.expandPath(trimmed)
+        } else {
+            resolvedPath = Self.expandPath("~/.elmterm.history")
+        }
+        return URL(fileURLWithPath: resolvedPath).standardizedFileURL
+    }
 }
 
 /// Configuration that describes the REPL environment.
@@ -101,6 +197,7 @@ struct TerminalConfiguration {
     let hexdump: Bool
     let timestamps: Bool
     let annotationIndent: Int
+    let colorPalette: ColorPalette
 }
 
 /// Supported command terminators for the REPL.
@@ -170,6 +267,7 @@ enum CommandTerminator: ExpressibleByArgument {
 final class TerminalController: NSObject {
 
     private let configuration: TerminalConfiguration
+    private let colorPalette: ColorPalette
     private var analyzer: OBD2Analyzer?
     private var keepRunning = true
     private var annotationEnabled: Bool
@@ -197,6 +295,7 @@ final class TerminalController: NSObject {
 
     init(configuration: TerminalConfiguration, analyzer: OBD2Analyzer?) {
         self.configuration = configuration
+        self.colorPalette = configuration.colorPalette
         self.analyzer = analyzer
         self.annotationEnabled = analyzer != nil
         super.init()
@@ -289,9 +388,8 @@ final class TerminalController: NSObject {
     }
 
     func report(error: Error) {
-        let red = "\u{001B}[31m"
-        let reset = OutputDirection.reset
-        self.emitLine("\(red)Error: \(error.localizedDescription)\(reset)")
+        let color = self.colorPalette.error
+        self.emitLine("\(color)Error: \(error.localizedDescription)\(ColorPalette.reset)")
     }
 
     private func readUserInput() throws -> String {
@@ -536,6 +634,7 @@ final class TerminalController: NSObject {
             }
 
             self.history.append(trimmed)
+            self.persistHistory()
             try self.sendToAdapter(trimmed)
         }
 
@@ -546,9 +645,8 @@ final class TerminalController: NSObject {
     private func handle(metaCommand: String) throws {
 
         guard let command = MetaCommand(metaCommand) else {
-            let red = "\u{001B}[31m"
-            let reset = OutputDirection.reset
-            self.emitLine("\(red)Unknown command: \(metaCommand)\(reset)")
+            let color = self.colorPalette.error
+            self.emitLine("\(color)Unknown command: \(metaCommand)\(ColorPalette.reset)")
             return
         }
 
@@ -627,16 +725,6 @@ final class TerminalController: NSObject {
         case outgoing
         case incoming
         case status
-
-        var ansiColor: String {
-            switch self {
-                case .outgoing: return "\u{001B}[34m"
-                case .incoming: return "\u{001B}[90m"
-                case .status:   return "\u{001B}[35m"
-            }
-        }
-
-        static let reset = "\u{001B}[0m"
     }
 
     private func printOutgoing(_ line: String) {
@@ -658,21 +746,37 @@ final class TerminalController: NSObject {
         }
         components.append(body)
         let line = components.isEmpty ? body : components.joined(separator: " ")
-        self.emitLine("\(direction.ansiColor)\(line)\(OutputDirection.reset)")
+        let color = self.color(for: direction)
+        self.emitLine("\(color)\(line)\(ColorPalette.reset)")
     }
 
     private func printAnnotation(_ annotation: AnalyzerOutput, direction: AdapterMessage.Direction) {
 
         guard self.annotationEnabled else { return }
         let indent = String(repeating: " ", count: self.configuration.annotationIndent)
-        let color = direction == .incoming ? OutputDirection.incoming.ansiColor : OutputDirection.outgoing.ansiColor
-        let dimColor = "\u{001B}[2m"
-        let reset = OutputDirection.reset
-        var lines = ["\(color)\(dimColor)→ \(annotation.headline)\(reset)"]
+        let color = self.annotationColor(for: direction)
+        var lines = ["\(color)→ \(annotation.headline)\(ColorPalette.reset)"]
         for line in annotation.details {
-            lines.append("\(color)\(dimColor)\(indent)  \(line)\(reset)")
+            lines.append("\(color)\(indent)  \(line)\(ColorPalette.reset)")
         }
         self.emitLines(lines)
+    }
+
+    private func color(for direction: OutputDirection) -> String {
+        switch direction {
+            case .outgoing: return self.colorPalette.outgoing
+            case .incoming: return self.colorPalette.incoming
+            case .status: return self.colorPalette.status
+        }
+    }
+
+    private func annotationColor(for direction: AdapterMessage.Direction) -> String {
+        switch direction {
+            case .incoming:
+                return self.colorPalette.annotationIncoming
+            case .outgoing:
+                return self.colorPalette.annotationOutgoing
+        }
     }
 
     private func flushPendingWritesSafely() {
@@ -768,11 +872,9 @@ final class TerminalController: NSObject {
         let data = Data(dataSlice)
         guard let line = String(data: data, encoding: .ascii) ?? String(data: data, encoding: .utf8) else {
             if self.configuration.hexdump {
-                let color = OutputDirection.incoming.ansiColor
-                let dimColor = "\u{001B}[2m"
-                let reset = OutputDirection.reset
+                let color = self.colorPalette.hexdump
                 let hexLines = data.hexdump().split(separator: "\n").map {
-                    "\(color)\(dimColor)\($0)\(reset)"
+                    "\(color)\($0)\(ColorPalette.reset)"
                 }
                 self.emitLines(hexLines)
             }
@@ -804,19 +906,15 @@ final class TerminalController: NSObject {
                 let ascii = bytes.map { byte in
                     (0x20...0x7E).contains(Int(byte)) ? String(UnicodeScalar(byte)) : "."
                 }.joined()
-                let color = OutputDirection.incoming.ansiColor
-                let dimColor = "\u{001B}[2m"
-                let reset = OutputDirection.reset
-                self.emitLine("\(color)\(dimColor)    ASCII: \(ascii)\(reset)")
+                let color = self.colorPalette.hexdump
+                self.emitLine("\(color)    ASCII: \(ascii)\(ColorPalette.reset)")
             }
         }
 
         if self.configuration.hexdump, let asciiData = trimmed.data(using: .utf8) {
-            let color = OutputDirection.incoming.ansiColor
-            let dimColor = "\u{001B}[2m"
-            let reset = OutputDirection.reset
+            let color = self.colorPalette.hexdump
             let hexLines = asciiData.hexdump().split(separator: "\n").map {
-                "\(color)\(dimColor)\($0)\(reset)"
+                "\(color)\($0)\(ColorPalette.reset)"
             }
             self.emitLines(hexLines)
         }
