@@ -1456,13 +1456,41 @@ final class OBD2Analyzer {
     }
 
     private func stripExtendedAddressIfNeeded(from bytes: inout [UInt8]) -> String? {
-        guard
-            let configuredExtendedAddress,
-            let first = bytes.first,
-            first == configuredExtendedAddress
-        else { return nil }
-        bytes.removeFirst()
-        return "CAN extended address 0x\(String(format: "%02X", configuredExtendedAddress)) stripped before decoding"
+        guard let first = bytes.first else { return nil }
+
+        if let configuredExtendedAddress, first == configuredExtendedAddress {
+            bytes.removeFirst()
+            return "CAN extended address 0x\(String(format: "%02X", configuredExtendedAddress)) stripped before decoding"
+        }
+
+        // When the adapter uses CAN extended addressing but no ATCER value was recorded,
+        // the first byte will not look like an ISO-TP PCI but the remainder will.
+        guard bytes.count >= 2 else { return nil }
+        let remainder = Array(bytes.dropFirst())
+        if !Self.looksLikeISOTPFrame(bytes), Self.looksLikeISOTPFrame(remainder) {
+            let stripped = bytes.removeFirst()
+            return "CAN extended address 0x\(String(format: "%02X", stripped)) stripped heuristically before decoding"
+        }
+        return nil
+    }
+
+    private static func looksLikeISOTPFrame(_ bytes: [UInt8]) -> Bool {
+        guard let first = bytes.first else { return false }
+        let frameType = first >> 4
+
+        switch frameType {
+            case 0x0:    // Single frame
+                let payloadLength = Int(first & 0x0F)
+                return payloadLength <= 7 && bytes.count >= payloadLength + 1
+            case 0x1:    // First frame
+                return bytes.count >= 3
+            case 0x2:    // Consecutive frame
+                return bytes.count >= 2
+            case 0x3:    // Flow control frame
+                return bytes.count >= 3
+            default:
+                return false
+        }
     }
 
     func hint(for buffer: String) -> (String?, (Int, Int, Int)?) {
