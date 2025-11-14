@@ -292,6 +292,7 @@ final class TerminalController: NSObject {
     private var lastSentCommand: String?
 
     private var pendingShutdown = false
+    private var streamsScheduledOnRunLoop = false
 
     init(configuration: TerminalConfiguration, analyzer: OBD2Analyzer?) {
         self.configuration = configuration
@@ -588,6 +589,7 @@ final class TerminalController: NSObject {
     private func configureStreams() {
 
         guard let inputStream, let outputStream else { return }
+        guard !self.streamsScheduledOnRunLoop else { return }
         inputStream.delegate = self
         outputStream.delegate = self
         let runLoop = RunLoop.main
@@ -595,6 +597,7 @@ final class TerminalController: NSObject {
         inputStream.open()
         outputStream.schedule(in: runLoop, forMode: .common)
         outputStream.open()
+        self.streamsScheduledOnRunLoop = true
     }
 
     private func cleanupStreams() {
@@ -602,8 +605,10 @@ final class TerminalController: NSObject {
         guard let inputStream, let outputStream else { return }
         inputStream.close()
         outputStream.close()
+        guard self.streamsScheduledOnRunLoop else { return }
         inputStream.remove(from: .main, forMode: .common)
         outputStream.remove(from: .main, forMode: .common)
+        self.streamsScheduledOnRunLoop = false
     }
 
     private func replLoop() async throws {
@@ -1060,6 +1065,7 @@ final class OBD2Analyzer {
     }
 
     private var isotpState: ISOTPReassembly?
+    private var configuredExtendedAddress: UInt8?
 
     private let atCommands: [String: String] = [
         "ATZ": "Reset adapter",
@@ -1173,6 +1179,7 @@ final class OBD2Analyzer {
     func annotateOutgoing(_ line: String) -> AnalyzerOutput? {
 
         let upper = line.uppercased()
+        self.updateAdapterState(for: upper)
         if upper.hasPrefix("AT") {
             let match = self.atCommands.first { upper.hasPrefix($0.key) }
             if let (command, description) = match {
@@ -1271,9 +1278,12 @@ final class OBD2Analyzer {
             return AnalyzerOutput(headline: "Adapter acknowledged command", details: [])
         }
 
-        guard let bytes = Self.bytes(fromResponse: upper), bytes.count >= 2 else {
+        guard var bytes = Self.bytes(fromResponse: upper), bytes.count >= 2 else {
             return nil
         }
+
+        let extendedAddressNote = self.stripExtendedAddressIfNeeded(from: &bytes)
+        guard bytes.count >= 2 else { return nil }
 
         // Check for negative response (7F xx yy)
         if bytes[0] == 0x7F && bytes.count >= 3 {
@@ -1284,14 +1294,16 @@ final class OBD2Analyzer {
             let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             let ascii = Self.asciiRepresentation(from: bytes)
 
+            var details: [String] = []
+            if let note = extendedAddressNote { details.append(note) }
+            details.append("Service 0x\(String(format: "%02X", serviceId)) failed")
+            details.append(nrcDescription)
+            details.append("Hex: \(hexBytes)")
+            details.append("ASCII: \(ascii)")
+
             return AnalyzerOutput(
                 headline: "❌ Negative Response (NRC 0x\(String(format: "%02X", nrcCode)))",
-                details: [
-                    "Service 0x\(String(format: "%02X", serviceId)) failed",
-                    nrcDescription,
-                    "Hex: \(hexBytes)",
-                    "ASCII: \(ascii)"
-                ]
+                details: details
             )
         }
 
@@ -1312,12 +1324,13 @@ final class OBD2Analyzer {
             )
 
             let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            var details: [String] = []
+            if let note = extendedAddressNote { details.append(note) }
+            details.append("Hex: \(hexBytes)")
+            details.append("Multi-frame message started, waiting for consecutive frames...")
             return AnalyzerOutput(
                 headline: "📦 ISO-TP First Frame (1/\(totalLength) bytes)",
-                details: [
-                    "Hex: \(hexBytes)",
-                    "Multi-frame message started, waiting for consecutive frames..."
-                ]
+                details: details
             )
         }
 
@@ -1328,24 +1341,26 @@ final class OBD2Analyzer {
 
             guard var state = self.isotpState else {
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+                var details: [String] = []
+                if let note = extendedAddressNote { details.append(note) }
+                details.append("Hex: \(hexBytes)")
+                details.append("Received consecutive frame without first frame")
                 return AnalyzerOutput(
                     headline: "⚠️ ISO-TP Consecutive Frame (orphaned)",
-                    details: [
-                        "Hex: \(hexBytes)",
-                        "Received consecutive frame without first frame"
-                    ]
+                    details: details
                 )
             }
 
             guard sequence == state.nextSequence else {
                 self.isotpState = nil
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+                var details: [String] = []
+                if let note = extendedAddressNote { details.append(note) }
+                details.append("Hex: \(hexBytes)")
+                details.append("Expected sequence \(state.nextSequence), got \(sequence)")
                 return AnalyzerOutput(
                     headline: "⚠️ ISO-TP Sequence Error",
-                    details: [
-                        "Hex: \(hexBytes)",
-                        "Expected sequence \(state.nextSequence), got \(sequence)"
-                    ]
+                    details: details
                 )
             }
 
@@ -1360,12 +1375,13 @@ final class OBD2Analyzer {
                 self.isotpState = state
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 let progress = "\(state.buffer.count)/\(state.totalLength)"
+                var details: [String] = []
+                if let note = extendedAddressNote { details.append(note) }
+                details.append("Hex: \(hexBytes)")
+                details.append("Sequence \(sequence), waiting for more frames...")
                 return AnalyzerOutput(
                     headline: "📦 ISO-TP Consecutive Frame (\(progress) bytes)",
-                    details: [
-                        "Hex: \(hexBytes)",
-                        "Sequence \(sequence), waiting for more frames..."
-                    ]
+                    details: details
                 )
             }
         }
@@ -1383,6 +1399,7 @@ final class OBD2Analyzer {
         let modeDescriptions = isOBD2 ? self.obd2ModeDescriptions : self.udsModeDescriptions
 
         var details: [String] = []
+        if let note = extendedAddressNote { details.append(note) }
         details.append("Hex: \(hexBytes)")
         details.append("ASCII: \(ascii)")
 
@@ -1398,6 +1415,54 @@ final class OBD2Analyzer {
         }
 
         return AnalyzerOutput(headline: "\(protocolName) response", details: details)
+    }
+
+    private func updateAdapterState(for command: String) {
+        if command.hasPrefix("ATCEA") {
+            let suffix = command.dropFirst("ATCEA".count)
+            if let value = Self.hexByte(from: suffix) {
+                self.configuredExtendedAddress = value
+            } else if suffix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.configuredExtendedAddress = nil
+            }
+            self.isotpState = nil
+            return
+        }
+
+        if command.hasPrefix("ATCER") {
+            let suffix = command.dropFirst("ATCER".count)
+            if let value = Self.hexByte(from: suffix) {
+                self.configuredExtendedAddress = value
+            } else if suffix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.configuredExtendedAddress = nil
+            }
+            self.isotpState = nil
+            return
+        }
+
+        let resetCommands = ["ATZ", "ATWS", "ATD", "ATPC"]
+        if resetCommands.contains(where: { command.hasPrefix($0) }) {
+            self.configuredExtendedAddress = nil
+            self.isotpState = nil
+        }
+    }
+
+    private static func hexByte(from substring: Substring) -> UInt8? {
+        let trimmed = substring.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalized = trimmed.replacingOccurrences(of: " ", with: "")
+        guard !normalized.isEmpty, normalized.count <= 2 else { return nil }
+        return UInt8(normalized, radix: 16)
+    }
+
+    private func stripExtendedAddressIfNeeded(from bytes: inout [UInt8]) -> String? {
+        guard
+            let configuredExtendedAddress,
+            let first = bytes.first,
+            first == configuredExtendedAddress
+        else { return nil }
+        bytes.removeFirst()
+        return "CAN extended address 0x\(String(format: "%02X", configuredExtendedAddress)) stripped before decoding"
     }
 
     func hint(for buffer: String) -> (String?, (Int, Int, Int)?) {
@@ -1453,11 +1518,11 @@ final class OBD2Analyzer {
         var dataStart = cleaned.startIndex
         let length = cleaned.count
 
-        // Check for standard 11-bit CAN IDs (3 hex digits: 7E8, 7E9, 7DF, etc.)
-        if length >= 3 {
+        // Check for standard 11-bit CAN IDs (3 hex digits such as 7E8, 6F1, 612, etc.)
+        // Headers always add an odd number of digits to the payload, so use that to detect them.
+        if length >= 3, length % 2 == 1 {
             let maybeHeader = cleaned.prefix(3)
-            // Common OBD-II CAN IDs start with 7 (e.g., 7E8-7EF, 7DF)
-            if maybeHeader.first == "7" {
+            if maybeHeader.allSatisfy({ $0.isHexDigit }) {
                 dataStart = cleaned.index(cleaned.startIndex, offsetBy: 3)
             }
         }
