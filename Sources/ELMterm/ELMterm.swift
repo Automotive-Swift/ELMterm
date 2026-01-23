@@ -98,6 +98,9 @@ struct ELMterm: AsyncParsableCommand {
     @Flag(name: .long, help: "Show a timestamp prefix for every RX/TX line.")
     var timestamps: Bool = false
 
+    @Option(name: .long, help: "Write communication log to the specified file.")
+    var log: String?
+
     mutating func run() async throws {
 
         guard let endpoint = URL(string: self.urlString) else {
@@ -112,6 +115,10 @@ struct ELMterm: AsyncParsableCommand {
         let historyURL = Self.makeHistoryURL(from: self.history ?? preferences.historyPath)
         let historyDepth = preferences.historyDepth ?? self.historyDepth
 
+        let logFileURL: URL? = self.log.map { path in
+            URL(fileURLWithPath: Self.expandPath(path)).standardizedFileURL
+        }
+
         let configuration = TerminalConfiguration(
             prompt: self.prompt,
             terminator: self.terminator,
@@ -120,7 +127,8 @@ struct ELMterm: AsyncParsableCommand {
             hexdump: self.hexdump,
             timestamps: self.timestamps,
             annotationIndent: 2,
-            colorPalette: palette
+            colorPalette: palette,
+            logFileURL: logFileURL
         )
 
         let controller = TerminalController(configuration: configuration, analyzer: self.plain ? nil : OBD2Analyzer())
@@ -198,6 +206,7 @@ struct TerminalConfiguration {
     let timestamps: Bool
     let annotationIndent: Int
     let colorPalette: ColorPalette
+    let logFileURL: URL?
 }
 
 /// Supported command terminators for the REPL.
@@ -294,12 +303,17 @@ final class TerminalController: NSObject {
     private var pendingShutdown = false
     private var streamsScheduledOnRunLoop = false
 
+    private var communicationLogger: CommunicationLogger?
+
     init(configuration: TerminalConfiguration, analyzer: OBD2Analyzer?) {
         self.configuration = configuration
         self.colorPalette = configuration.colorPalette
         self.analyzer = analyzer
         self.annotationEnabled = analyzer != nil
         super.init()
+        if let logURL = configuration.logFileURL {
+            self.communicationLogger = CommunicationLogger(url: logURL)
+        }
     }
 
     private func beginLineEditing() {
@@ -671,6 +685,8 @@ final class TerminalController: NSObject {
                 }
                 let state = self.annotationEnabled ? "enabled" : "disabled"
                 self.printStatus("Analyzer \(state).")
+            case .log(let action):
+                self.handleLogCommand(action)
             case .quit:
                 self.keepRunning = false
             case .saveHistory:
@@ -685,6 +701,7 @@ final class TerminalController: NSObject {
         :history [n]       Print the last n commands (default 20)
         :clear             Clear the screen
         :analyzer [on|off] Toggle or force analyzer output
+        :log [path|off]    Start/stop logging or show status
         :save              Persist the in-memory history
         :quit              Exit ELMterm
         """
@@ -705,6 +722,25 @@ final class TerminalController: NSObject {
         self.emitLines(lines)
     }
 
+    private func handleLogCommand(_ action: MetaCommand.LogAction) {
+        switch action {
+            case .status:
+                if let logger = self.communicationLogger {
+                    self.printStatus("Logging to \(logger.url.path)")
+                } else {
+                    self.printStatus("Logging is off.")
+                }
+            case .start(let path):
+                let expandedPath = (path as NSString).expandingTildeInPath
+                let url = URL(fileURLWithPath: expandedPath).standardizedFileURL
+                self.communicationLogger = CommunicationLogger(url: url)
+                self.printStatus("Logging to \(url.path)")
+            case .stop:
+                self.communicationLogger = nil
+                self.printStatus("Logging stopped.")
+        }
+    }
+
     private func sendToAdapter(_ line: String) throws {
 
         self.echoLock.lock()
@@ -713,6 +749,7 @@ final class TerminalController: NSObject {
 
         let payload = line.appendingTerminator(self.configuration.terminator.bytes)
         self.printOutgoing(line)
+        self.communicationLogger?.log(direction: .tx, message: line)
         if self.annotationEnabled, let annotation = self.analyzer?.annotateOutgoing(line) {
             self.printAnnotation(annotation, direction: .outgoing)
         }
@@ -904,6 +941,7 @@ final class TerminalController: NSObject {
         guard !trimmed.isEmpty else { return }
 
         self.printIncoming(trimmed)
+        self.communicationLogger?.log(direction: .rx, message: trimmed)
 
         // Show ASCII representation for long hex-looking lines
         if trimmed.count > 30 && self.looksLikeHex(trimmed) {
@@ -985,19 +1023,26 @@ extension TerminalController: @unchecked Sendable {}
 
 private enum MetaCommand {
 
+    enum LogAction {
+        case status
+        case start(path: String)
+        case stop
+    }
+
     case help
     case history(limit: Int?)
     case clear
     case analyzer(Bool?)
+    case log(LogAction)
     case quit
     case saveHistory
 
     init?(_ line: String) {
         guard line.hasPrefix(":") else { return nil }
-        let components = line
+        let rawComponents = line
             .dropFirst()
             .split(separator: " ", omittingEmptySubsequences: true)
-            .map { $0.lowercased() }
+        let components = rawComponents.map { $0.lowercased() }
         guard let keyword = components.first else { return nil }
         switch keyword {
             case "help":
@@ -1020,6 +1065,18 @@ private enum MetaCommand {
                 } else {
                     self = .analyzer(nil)
                 }
+            case "log":
+                if let arg = components.dropFirst().first {
+                    switch arg {
+                        case "off", "stop":
+                            self = .log(.stop)
+                        default:
+                            let path = String(rawComponents.dropFirst().first!)
+                            self = .log(.start(path: path))
+                    }
+                } else {
+                    self = .log(.status)
+                }
             case "quit", "exit":
                 self = .quit
             case "save":
@@ -1036,6 +1093,7 @@ private enum MetaCommand {
             ":history",
             ":clear",
             ":analyzer",
+            ":log",
             ":save",
             ":quit",
         ]
@@ -1759,5 +1817,49 @@ extension Data {
             offset += width
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+// MARK: - Communication Logger
+
+final class CommunicationLogger {
+
+    enum Direction: String {
+        case tx = "TX"
+        case rx = "RX"
+    }
+
+    let url: URL
+    private let fileHandle: FileHandle?
+    private let queue = DispatchQueue(label: "ELMterm.logger")
+    private lazy var timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    init(url: URL) {
+        self.url = url
+        let manager = FileManager.default
+        if !manager.fileExists(atPath: url.path) {
+            manager.createFile(atPath: url.path, contents: nil)
+        }
+        self.fileHandle = try? FileHandle(forWritingTo: url)
+        self.fileHandle?.seekToEndOfFile()
+    }
+
+    deinit {
+        try? self.fileHandle?.close()
+    }
+
+    func log(direction: Direction, message: String) {
+        self.queue.async { [weak self] in
+            guard let self, let handle = self.fileHandle else { return }
+            let timestamp = self.timestampFormatter.string(from: Date())
+            let line = "[\(timestamp)] \(direction.rawValue): \(message)\n"
+            if let data = line.data(using: .utf8) {
+                try? handle.write(contentsOf: data)
+            }
+        }
     }
 }
