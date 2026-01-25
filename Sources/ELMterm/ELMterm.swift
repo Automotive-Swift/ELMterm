@@ -1166,6 +1166,20 @@ final class OBD2Analyzer {
         "STCSMT": "CAN silent mode timeout",
     ]
 
+    private let busProtocolDescriptions: [String: String] = [
+        "OBD2_OBD_BUSPROTO_?": "Unknown",
+        "OBD2_OBD_BUSPROTO_0": "Automatic",
+        "OBD2_OBD_BUSPROTO_1": "SAE J1850 PWM",
+        "OBD2_OBD_BUSPROTO_2": "SAE J1850 VPW",
+        "OBD2_OBD_BUSPROTO_3": "ISO 9141-2",
+        "OBD2_OBD_BUSPROTO_4": "ISO 14230-4 (KWP 5BAUD)",
+        "OBD2_OBD_BUSPROTO_5": "ISO 14230-4 (KWP FAST)",
+        "OBD2_OBD_BUSPROTO_6": "ISO 15765-4 (CAN 11/500)",
+        "OBD2_OBD_BUSPROTO_7": "ISO 15765-4 (CAN 29/500)",
+        "OBD2_OBD_BUSPROTO_8": "ISO 15765-4 (CAN 11/250)",
+        "OBD2_OBD_BUSPROTO_9": "ISO 15765-4 (CAN 29/250)",
+    ]
+
     private struct PIDInfo {
         let description: String
         let formatter: ([UInt8]) -> String?
@@ -1334,6 +1348,9 @@ final class OBD2Analyzer {
         }
         if upper == "OK" {
             return AnalyzerOutput(headline: "Adapter acknowledged command", details: [])
+        }
+        if let description = self.busProtocolDescriptions[upper] {
+            return AnalyzerOutput(headline: "Bus protocol", details: [description])
         }
 
         guard var bytes = Self.bytes(fromResponse: upper), bytes.count >= 2 else {
