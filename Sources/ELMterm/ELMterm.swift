@@ -421,6 +421,7 @@ final class TerminalController: NSObject {
         var buffer = ""
         var cursorPos = 0
         var historyIndex: Int? = nil
+        let pollInterval: TimeInterval = 0.1
 
         // Set terminal to raw mode
         var originalTermios = termios()
@@ -439,11 +440,12 @@ final class TerminalController: NSObject {
         var escapeSequence: [UInt8] = []
 
         while true {
-            var char: UInt8 = 0
-            let bytesRead = read(STDIN_FILENO, &char, 1)
+            if !self.keepRunning || self.pendingShutdown {
+                return ""
+            }
 
-            guard bytesRead > 0 else {
-                throw SimpleReadLineError.eof
+            guard let char = try self.readChar(timeout: pollInterval) else {
+                continue
             }
 
             // Handle escape sequences
@@ -517,6 +519,7 @@ final class TerminalController: NSObject {
             if char == 3 { // Ctrl-C
                 fputs("^C\n", stdout)
                 fflush(stdout)
+                self.requestStop(reason: "Interrupted")
                 return ""
             }
 
@@ -542,6 +545,35 @@ final class TerminalController: NSObject {
                 cursorPos += 1
             }
         }
+    }
+
+    private func readChar(timeout: TimeInterval) throws -> UInt8? {
+        let timeoutMs = Int32(timeout * 1000)
+        var readFD = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let result = poll(&readFD, 1, timeoutMs)
+
+        if result == 0 {
+            return nil
+        }
+        if result < 0 {
+            if errno == EINTR {
+                return nil
+            }
+            throw SimpleReadLineError.eof
+        }
+
+        var char: UInt8 = 0
+        let bytesRead = read(STDIN_FILENO, &char, 1)
+        if bytesRead > 0 {
+            return char
+        }
+        if bytesRead == 0 {
+            throw SimpleReadLineError.eof
+        }
+        if errno == EINTR {
+            return nil
+        }
+        throw SimpleReadLineError.eof
     }
 
     private func replaceLineBuffer(_ buffer: inout String, _ cursorPos: inout Int, with newContent: String, prompt: String) {
@@ -619,10 +651,14 @@ final class TerminalController: NSObject {
         guard let inputStream, let outputStream else { return }
         inputStream.close()
         outputStream.close()
-        guard self.streamsScheduledOnRunLoop else { return }
-        inputStream.remove(from: .main, forMode: .common)
-        outputStream.remove(from: .main, forMode: .common)
-        self.streamsScheduledOnRunLoop = false
+        if self.streamsScheduledOnRunLoop {
+            inputStream.remove(from: .main, forMode: .common)
+            outputStream.remove(from: .main, forMode: .common)
+            self.streamsScheduledOnRunLoop = false
+        }
+        self.inputStream = nil
+        self.outputStream = nil
+        self.pendingWriteBuffer.removeAll()
     }
 
     private func replLoop() async throws {
@@ -636,6 +672,9 @@ final class TerminalController: NSObject {
                 break
             } catch {
                 throw error
+            }
+            if !self.keepRunning {
+                break
             }
 
             // Filter out any stray CR characters and then trim whitespace.
@@ -742,6 +781,7 @@ final class TerminalController: NSObject {
     }
 
     private func sendToAdapter(_ line: String) throws {
+        guard !self.pendingShutdown, self.outputStream?.streamStatus == .open else { return }
 
         self.echoLock.lock()
         self.lastSentCommand = line
@@ -831,9 +871,14 @@ final class TerminalController: NSObject {
 
     private func flushPendingWrites() throws {
 
-        guard let outputStream else { return }
         self.transmitLock.lock()
         defer { self.transmitLock.unlock() }
+        guard !self.pendingShutdown,
+              let outputStream,
+              outputStream.streamStatus == .open else {
+            self.pendingWriteBuffer.removeAll()
+            return
+        }
 
         while !self.pendingWriteBuffer.isEmpty {
             let wrote = self.pendingWriteBuffer.withUnsafeBytes { rawBuffer -> Int in
@@ -1166,20 +1211,6 @@ final class OBD2Analyzer {
         "STCSMT": "CAN silent mode timeout",
     ]
 
-    private let busProtocolDescriptions: [String: String] = [
-        "OBD2_OBD_BUSPROTO_?": "Unknown",
-        "OBD2_OBD_BUSPROTO_0": "Automatic",
-        "OBD2_OBD_BUSPROTO_1": "SAE J1850 PWM",
-        "OBD2_OBD_BUSPROTO_2": "SAE J1850 VPW",
-        "OBD2_OBD_BUSPROTO_3": "ISO 9141-2",
-        "OBD2_OBD_BUSPROTO_4": "ISO 14230-4 (KWP 5BAUD)",
-        "OBD2_OBD_BUSPROTO_5": "ISO 14230-4 (KWP FAST)",
-        "OBD2_OBD_BUSPROTO_6": "ISO 15765-4 (CAN 11/500)",
-        "OBD2_OBD_BUSPROTO_7": "ISO 15765-4 (CAN 29/500)",
-        "OBD2_OBD_BUSPROTO_8": "ISO 15765-4 (CAN 11/250)",
-        "OBD2_OBD_BUSPROTO_9": "ISO 15765-4 (CAN 29/250)",
-    ]
-
     private struct PIDInfo {
         let description: String
         let formatter: ([UInt8]) -> String?
@@ -1348,9 +1379,6 @@ final class OBD2Analyzer {
         }
         if upper == "OK" {
             return AnalyzerOutput(headline: "Adapter acknowledged command", details: [])
-        }
-        if let description = self.busProtocolDescriptions[upper] {
-            return AnalyzerOutput(headline: "Bus protocol", details: [description])
         }
 
         guard var bytes = Self.bytes(fromResponse: upper), bytes.count >= 2 else {
