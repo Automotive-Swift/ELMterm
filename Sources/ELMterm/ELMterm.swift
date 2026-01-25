@@ -1161,13 +1161,19 @@ struct AnalyzerOutput {
 /// Provides lightweight semantic hints for OBD-II frames.
 final class OBD2Analyzer {
 
+    private struct ISOTPKey: Hashable {
+        let canId: UInt32?
+        let extendedAddress: UInt8?
+    }
+
     private struct ISOTPReassembly {
         var totalLength: Int
         var buffer: [UInt8]
         var nextSequence: UInt8
     }
 
-    private var isotpState: ISOTPReassembly?
+    private var isotpStates: [ISOTPKey: ISOTPReassembly] = [:]
+    private var isotpNeedsHeaders = false
     private var configuredExtendedAddress: UInt8?
 
     private let atCommands: [String: String] = [
@@ -1309,6 +1315,9 @@ final class OBD2Analyzer {
             return nil
         }
 
+        self.isotpStates.removeAll()
+        self.isotpNeedsHeaders = false
+
         var details: [String] = []
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         details.append("Hex: \(hexBytes)")
@@ -1381,12 +1390,15 @@ final class OBD2Analyzer {
             return AnalyzerOutput(headline: "Adapter acknowledged command", details: [])
         }
 
-        guard var bytes = Self.bytes(fromResponse: upper), bytes.count >= 2 else {
+        guard let parsed = Self.parseResponse(upper), parsed.bytes.count >= 2 else {
             return nil
         }
 
-        let extendedAddressNote = self.stripExtendedAddressIfNeeded(from: &bytes)
+        var bytes = parsed.bytes
+        let (extendedAddressNote, extendedAddress) = self.stripExtendedAddressIfNeeded(from: &bytes)
         guard bytes.count >= 2 else { return nil }
+
+        let isotpKey = ISOTPKey(canId: parsed.header, extendedAddress: extendedAddress)
 
         // Check for negative response (7F xx yy)
         if bytes[0] == 0x7F && bytes.count >= 3 {
@@ -1415,12 +1427,26 @@ final class OBD2Analyzer {
 
         // First Frame (0x10-0x1F)
         if frameType == 0x1 && bytes.count >= 2 {
+            if parsed.header == nil, !self.isotpStates.isEmpty {
+                self.isotpStates.removeAll()
+                self.isotpNeedsHeaders = true
+                return AnalyzerOutput(
+                    headline: "⚠️ ISO-TP multi-ECU response without headers",
+                    details: ["Enable ATH1 or filter responses (e.g., ATCRA) to decode multi-frame messages."]
+                )
+            }
+            if parsed.header == nil, self.isotpNeedsHeaders {
+                return AnalyzerOutput(
+                    headline: "⚠️ ISO-TP disabled without headers",
+                    details: ["Multiple responders detected; enable ATH1 to reassemble."]
+                )
+            }
             let lengthHigh = Int(bytes[0] & 0x0F)
             let lengthLow = Int(bytes[1])
             let totalLength = (lengthHigh << 8) | lengthLow
             let dataBytes = Array(bytes.dropFirst(2))
 
-            self.isotpState = ISOTPReassembly(
+            self.isotpStates[isotpKey] = ISOTPReassembly(
                 totalLength: totalLength,
                 buffer: dataBytes,
                 nextSequence: 1
@@ -1439,10 +1465,16 @@ final class OBD2Analyzer {
 
         // Consecutive Frame (0x20-0x2F)
         if frameType == 0x2 {
+            if parsed.header == nil, self.isotpNeedsHeaders {
+                return AnalyzerOutput(
+                    headline: "⚠️ ISO-TP disabled without headers",
+                    details: ["Multiple responders detected; enable ATH1 to reassemble."]
+                )
+            }
             let sequence = bytes[0] & 0x0F
             let dataBytes = Array(bytes.dropFirst(1))
 
-            guard var state = self.isotpState else {
+            guard var state = self.isotpStates[isotpKey] else {
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 var details: [String] = []
                 if let note = extendedAddressNote { details.append(note) }
@@ -1455,7 +1487,7 @@ final class OBD2Analyzer {
             }
 
             guard sequence == state.nextSequence else {
-                self.isotpState = nil
+                self.isotpStates.removeValue(forKey: isotpKey)
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 var details: [String] = []
                 if let note = extendedAddressNote { details.append(note) }
@@ -1472,10 +1504,10 @@ final class OBD2Analyzer {
 
             if state.buffer.count >= state.totalLength {
                 let completeMessage = Array(state.buffer.prefix(state.totalLength))
-                self.isotpState = nil
+                self.isotpStates.removeValue(forKey: isotpKey)
                 return self.decodeCompleteISOTPMessage(completeMessage)
             } else {
-                self.isotpState = state
+                self.isotpStates[isotpKey] = state
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 let progress = "\(state.buffer.count)/\(state.totalLength)"
                 var details: [String] = []
@@ -1528,7 +1560,8 @@ final class OBD2Analyzer {
             } else if suffix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.configuredExtendedAddress = nil
             }
-            self.isotpState = nil
+            self.isotpStates.removeAll()
+            self.isotpNeedsHeaders = false
             return
         }
 
@@ -1539,14 +1572,16 @@ final class OBD2Analyzer {
             } else if suffix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.configuredExtendedAddress = nil
             }
-            self.isotpState = nil
+            self.isotpStates.removeAll()
+            self.isotpNeedsHeaders = false
             return
         }
 
         let resetCommands = ["ATZ", "ATWS", "ATD", "ATPC"]
         if resetCommands.contains(where: { command.hasPrefix($0) }) {
             self.configuredExtendedAddress = nil
-            self.isotpState = nil
+            self.isotpStates.removeAll()
+            self.isotpNeedsHeaders = false
         }
     }
 
@@ -1558,23 +1593,29 @@ final class OBD2Analyzer {
         return UInt8(normalized, radix: 16)
     }
 
-    private func stripExtendedAddressIfNeeded(from bytes: inout [UInt8]) -> String? {
-        guard let first = bytes.first else { return nil }
+    private func stripExtendedAddressIfNeeded(from bytes: inout [UInt8]) -> (String?, UInt8?) {
+        guard let first = bytes.first else { return (nil, nil) }
 
         if let configuredExtendedAddress, first == configuredExtendedAddress {
             bytes.removeFirst()
-            return "CAN extended address 0x\(String(format: "%02X", configuredExtendedAddress)) stripped before decoding"
+            return (
+                "CAN extended address 0x\(String(format: "%02X", configuredExtendedAddress)) stripped before decoding",
+                configuredExtendedAddress
+            )
         }
 
         // When the adapter uses CAN extended addressing but no ATCER value was recorded,
         // the first byte will not look like an ISO-TP PCI but the remainder will.
-        guard bytes.count >= 2 else { return nil }
+        guard bytes.count >= 2 else { return (nil, nil) }
         let remainder = Array(bytes.dropFirst())
         if !Self.looksLikeISOTPFrame(bytes), Self.looksLikeISOTPFrame(remainder) {
             let stripped = bytes.removeFirst()
-            return "CAN extended address 0x\(String(format: "%02X", stripped)) stripped heuristically before decoding"
+            return (
+                "CAN extended address 0x\(String(format: "%02X", stripped)) stripped heuristically before decoding",
+                stripped
+            )
         }
-        return nil
+        return (nil, nil)
     }
 
     private static func looksLikeISOTPFrame(_ bytes: [UInt8]) -> Bool {
@@ -1642,32 +1683,47 @@ final class OBD2Analyzer {
         return bytes
     }
 
-    private static func bytes(fromResponse text: String) -> [UInt8]? {
-        let cleaned = text.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "\t", with: "")
+    private struct ParsedResponse {
+        let header: UInt32?
+        let bytes: [UInt8]
+    }
 
-        // Try to detect and skip common CAN headers
+    private static func parseResponse(_ text: String) -> ParsedResponse? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let tokens = trimmed.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        if tokens.count >= 2,
+           let headerToken = tokens.first,
+           (headerToken.count == 3 || headerToken.count == 8),
+           headerToken.allSatisfy({ $0.isHexDigit }),
+           tokens.dropFirst().allSatisfy({ $0.count == 2 && $0.allSatisfy({ $0.isHexDigit }) }) {
+            let header = UInt32(headerToken, radix: 16)
+            let bytes = tokens.dropFirst().compactMap { UInt8($0, radix: 16) }
+            return bytes.isEmpty ? nil : ParsedResponse(header: header, bytes: bytes)
+        }
+
+        let cleaned = trimmed.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "\t", with: "")
+        var header: UInt32?
         var dataStart = cleaned.startIndex
         let length = cleaned.count
 
-        // Check for standard 11-bit CAN IDs (3 hex digits such as 7E8, 6F1, 612, etc.)
-        // Headers always add an odd number of digits to the payload, so use that to detect them.
         if length >= 3, length % 2 == 1 {
             let maybeHeader = cleaned.prefix(3)
             if maybeHeader.allSatisfy({ $0.isHexDigit }) {
+                header = UInt32(maybeHeader, radix: 16)
                 dataStart = cleaned.index(cleaned.startIndex, offsetBy: 3)
             }
         }
 
-        // Check for extended 29-bit CAN IDs (8 hex digits)
-        if dataStart == cleaned.startIndex && length >= 8 {
+        if header == nil, length >= 8 {
             let maybeExtended = cleaned.prefix(8)
-            // Extended CAN typically starts with patterns like 18DA, 18DB
-            if maybeExtended.hasPrefix("18") {
+            if maybeExtended.allSatisfy({ $0.isHexDigit }), maybeExtended.hasPrefix("18") {
+                header = UInt32(maybeExtended, radix: 16)
                 dataStart = cleaned.index(cleaned.startIndex, offsetBy: 8)
             }
         }
 
-        // Parse data bytes from the remaining string
         let dataString = String(cleaned[dataStart...])
         guard !dataString.isEmpty else { return nil }
 
@@ -1687,7 +1743,7 @@ final class OBD2Analyzer {
             }
         }
 
-        return bytes.isEmpty ? nil : bytes
+        return bytes.isEmpty ? nil : ParsedResponse(header: header, bytes: bytes)
     }
 
     private static func asciiRepresentation(_ text: String) -> String {
