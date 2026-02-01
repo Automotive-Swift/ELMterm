@@ -1606,7 +1606,12 @@ final class OBD2Analyzer {
 
         // When the adapter uses CAN extended addressing but no ATCER value was recorded,
         // the first byte will not look like an ISO-TP PCI but the remainder will.
+        // Avoid false positives when the first byte already looks like an OBD/UDS response.
         guard bytes.count >= 2 else { return (nil, nil) }
+        let serviceByte = bytes[0]
+        if serviceByte == 0x7F || (0x40...0x7F).contains(serviceByte) {
+            return (nil, nil)
+        }
         let remainder = Array(bytes.dropFirst())
         if !Self.looksLikeISOTPFrame(bytes), Self.looksLikeISOTPFrame(remainder) {
             let stripped = bytes.removeFirst()
@@ -1625,7 +1630,7 @@ final class OBD2Analyzer {
         switch frameType {
             case 0x0:    // Single frame
                 let payloadLength = Int(first & 0x0F)
-                return payloadLength <= 7 && bytes.count >= payloadLength + 1
+                return payloadLength >= 1 && payloadLength <= 7 && bytes.count >= payloadLength + 1
             case 0x1:    // First frame
                 return bytes.count >= 3
             case 0x2:    // Consecutive frame
