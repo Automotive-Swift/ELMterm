@@ -1405,19 +1405,30 @@ final class OBD2Analyzer {
             let serviceId = bytes[1]
             let nrcCode = bytes[2]
             let nrcDescription = Self.nrcDescription(for: nrcCode)
+            let isResponsePending = nrcCode == 0x78
 
             let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             let ascii = Self.asciiRepresentation(from: bytes)
 
             var details: [String] = []
             if let note = extendedAddressNote { details.append(note) }
-            details.append("Service 0x\(String(format: "%02X", serviceId)) failed")
-            details.append(nrcDescription)
-            details.append("Hex: \(hexBytes)")
-            details.append("ASCII: \(ascii)")
+            if isResponsePending {
+                details.append("Service 0x\(String(format: "%02X", serviceId)) response pending")
+            } else {
+                details.append("Service 0x\(String(format: "%02X", serviceId)) failed")
+            }
+            if !isResponsePending {
+                details.append(nrcDescription)
+                details.append("Hex: \(hexBytes)")
+                details.append("ASCII: \(ascii)")
+            }
+
+            let headline = isResponsePending
+                ? "⏳ ECU busy (NRC 0x78)"
+                : "❌ Negative Response (NRC 0x\(String(format: "%02X", nrcCode)))"
 
             return AnalyzerOutput(
-                headline: "❌ Negative Response (NRC 0x\(String(format: "%02X", nrcCode)))",
+                headline: headline,
                 details: details
             )
         }
