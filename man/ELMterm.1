@@ -1,0 +1,98 @@
+.Dd February 9, 2026
+.Dt ELMTERM 1
+.Os
+.Sh NAME
+.Nm ELMterm
+.Nd transport-agnostic terminal for ELM-compatible OBD-II adapters
+.Sh SYNOPSIS
+.Nm
+.Ar url-string
+.Op Fl -timeout Ar seconds
+.Op Fl -prompt Ar text
+.Op Fl -terminator Ar mode
+.Op Fl -history Ar path
+.Op Fl -history-depth Ar count
+.Op Fl -config Ar path
+.Op Fl -theme Ar light|dark
+.Op Fl -hexdump
+.Op Fl -plain
+.Op Fl -timestamps
+.Op Fl -log Ar path
+.Sh DESCRIPTION
+.Nm
+connects to serial or TCP ELM-compatible interfaces and provides an interactive
+REPL with protocol-aware annotations for OBD-II traffic.
+.Sh ARGUMENTS
+.Bl -tag -width Ds
+.It Ar url-string
+Connection URL, for example
+.Dq tty:///dev/cu.usbserial-XXXX
+or
+.Dq tcp://192.168.0.10:35000 .
+.El
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl -timeout Ar seconds
+Connection timeout. Default: 12.
+.It Fl -prompt Ar text
+Prompt shown in interactive mode. Default:
+.Dq > .
+.It Fl -terminator Ar mode
+Terminator appended to commands. Supports
+.Dq cr ,
+.Dq lf ,
+.Dq crlf ,
+.Dq none ,
+.Dq hex:...
+or literal text.
+.It Fl -history Ar path
+Path to persistent history file.
+.It Fl -history-depth Ar count
+Maximum number of history entries. Default: 500.
+.It Fl -config Ar path
+Path to JSON configuration file. Defaults to
+.Pa ~/.elmterm.json
+when present.
+.It Fl -theme Ar light|dark
+Force color theme.
+.It Fl -hexdump
+Print incoming frames as ASCII plus hexadecimal dump.
+.It Fl -plain
+Disable analyzer and annotation pipeline.
+.It Fl -timestamps
+Prefix RX and TX lines with ISO8601 timestamps.
+.It Fl -log Ar path
+Write communication log output to file.
+.It Fl h , Fl -help
+Show help output.
+.El
+.Sh META COMMANDS
+Inside the REPL, meta commands start with a colon:
+.Bl -tag -width Ds
+.It Ic :help
+Show available commands.
+.It Ic :history Op Ar n
+Show the most recent history entries.
+.It Ic :clear
+Clear terminal output.
+.It Ic :analyzer Op Ic on|off
+Toggle protocol analyzer annotations.
+.It Ic :save
+Persist in-memory history immediately.
+.It Ic :quit
+Exit the REPL.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.elmterm.history
+Default persistent command history file.
+.It Pa ~/.elmterm.json
+Optional JSON configuration file.
+.El
+.Sh EXAMPLES
+.Bd -literal -offset indent
+ELMterm tty:///dev/cu.usbserial-113010893810
+ELMterm tcp://192.168.0.10:35000 --timestamps
+.Ed
+.Sh EXIT STATUS
+.Ex -std
