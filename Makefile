@@ -30,16 +30,16 @@ release:
 		exit 1; \
 	fi; \
 	if git rev-parse -q --verify "refs/tags/$$VERSION" >/dev/null; then \
-		echo "Tag $$VERSION already exists."; \
-		exit 1; \
+		echo "Tag $$VERSION already exists locally; skipping ELMterm tag/push."; \
+	else \
+		CURRENT_BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+		echo "Creating release commit and tag $$VERSION on $$CURRENT_BRANCH"; \
+		git add -A; \
+		git commit --allow-empty -m "Release $$VERSION"; \
+		git tag -a "$$VERSION" -m "Release $$VERSION"; \
+		git push origin "$$CURRENT_BRANCH"; \
+		git push origin "$$VERSION"; \
 	fi; \
-	CURRENT_BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
-	echo "Creating release commit and tag $$VERSION on $$CURRENT_BRANCH"; \
-	git add -A; \
-	git commit --allow-empty -m "Release $$VERSION"; \
-	git tag -a "$$VERSION" -m "Release $$VERSION"; \
-	git push origin "$$CURRENT_BRANCH"; \
-	git push origin "$$VERSION"; \
 	TARBALL_URL="https://github.com/Automotive-Swift/ELMterm/archive/refs/tags/$$VERSION.tar.gz"; \
 	echo "Downloading $$TARBALL_URL"; \
 	SHA256=$$(curl -fsSL "$$TARBALL_URL" | shasum -a 256 | awk '{print $$1}'); \
@@ -50,7 +50,11 @@ release:
 	fi; \
 	FORMULA_BRANCH=$$(git -C "$(FORMULA_REPO)" rev-parse --abbrev-ref HEAD); \
 	git -C "$(FORMULA_REPO)" pull --ff-only origin "$$FORMULA_BRANCH"; \
-	VERSION="$$VERSION" SHA256="$$SHA256" ruby -i -pe 'sub(/^  url ".*"$$/, "  url \"https://github.com/Automotive-Swift/ELMterm/archive/refs/tags/#{ENV.fetch(\"VERSION\")}.tar.gz\""); sub(/^  version ".*"$$/, "  version \"#{ENV.fetch(\"VERSION\")}\""); sub(/^  sha256 ".*"$$/, "  sha256 \"#{ENV.fetch(\"SHA256\")}\"")' "$(FORMULA_FILE)"; \
+	sed -i '' \
+		-e "s|^  url \".*\"|  url \"https://github.com/Automotive-Swift/ELMterm/archive/refs/tags/$$VERSION.tar.gz\"|" \
+		-e "s|^  version \".*\"|  version \"$$VERSION\"|" \
+		-e "s|^  sha256 \".*\"|  sha256 \"$$SHA256\"|" \
+		"$(FORMULA_FILE)"; \
 	/opt/homebrew/bin/brew style "$(FORMULA_FILE)"; \
 	git -C "$(FORMULA_REPO)" add "$(FORMULA_RELATIVE)"; \
 	git -C "$(FORMULA_REPO)" commit -m "elmterm $$VERSION"; \
