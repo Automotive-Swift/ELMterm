@@ -99,6 +99,13 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
 
 ## Installation
 
+### Homebrew (macOS)
+
+```bash
+brew tap mickeyl/formulae
+brew install elmterm
+```
+
 ### Prerequisites
 
 - macOS 13 or later
