@@ -1201,7 +1201,7 @@ final class OBD2Analyzer {
         "STSN": "Set serial number",
         "STRSN": "Read serial number",
         "STMA": "Monitor all messages",
-        "STMFR": "Monitor for receiver",
+        "STMFR": "STN Manufacturer",
         "STFMR": "Flow control mode receive",
         "STFAP": "Flow control address pair",
         "STFCP": "Flow control CAN protocol",
