@@ -1285,6 +1285,117 @@ final class OBD2Analyzer {
         0x85: "Control DTC setting",
     ]
 
+    // Well-known DIDs (ISO 14229 Annex C) for services 0x22/0x2E
+    private let didDescriptions: [UInt16: String] = [
+        0xF180: "Boot software identification",
+        0xF186: "Active diagnostic session",
+        0xF187: "Spare part number",
+        0xF188: "ECU software number",
+        0xF189: "ECU software version number",
+        0xF18A: "System supplier identifier",
+        0xF18B: "ECU manufacturing date",
+        0xF18C: "ECU serial number",
+        0xF190: "VIN",
+        0xF191: "ECU hardware number",
+        0xF192: "System supplier ECU hardware number",
+        0xF193: "System supplier ECU hardware version",
+        0xF194: "System supplier ECU software number",
+        0xF195: "System supplier ECU software version",
+        0xF197: "System name or engine type",
+        0xF199: "Programming date",
+        0xF19E: "ASAM/ODX file identifier",
+        0xF1A0: "Diagnostic version",
+    ]
+
+    // Sub-function descriptions per UDS service
+    private let udsSubFunctions: [UInt8: [UInt8: String]] = [
+        0x10: [  // Diagnostic session control
+            0x01: "Default session",
+            0x02: "Programming session",
+            0x03: "Extended diagnostic session",
+        ],
+        0x11: [  // ECU reset
+            0x01: "Hard reset",
+            0x02: "Key off/on reset",
+            0x03: "Soft reset",
+        ],
+        0x19: [  // Read DTC information
+            0x01: "Report number of DTC by status mask",
+            0x02: "Report DTC by status mask",
+            0x03: "Report DTC snapshot identification",
+            0x04: "Report DTC snapshot record by DTC number",
+            0x06: "Report DTC extended data record by DTC number",
+            0x0A: "Report supported DTCs",
+            0x0E: "Report most recent confirmed DTC",
+            0x13: "Report emissions-related OBD DTC by status mask",
+            0x14: "Report DTC fault detection counter",
+        ],
+        0x28: [  // Communication control
+            0x00: "Enable Rx and Tx",
+            0x01: "Enable Rx, disable Tx",
+            0x02: "Disable Rx, enable Tx",
+            0x03: "Disable Rx and Tx",
+        ],
+        0x31: [  // Routine control
+            0x01: "Start routine",
+            0x02: "Stop routine",
+            0x03: "Request routine results",
+        ],
+        0x3E: [  // Tester present
+            0x00: "Zero sub-function",
+        ],
+        0x85: [  // Control DTC setting
+            0x01: "On",
+            0x02: "Off",
+        ],
+    ]
+
+    private func describeUDSSubParameters(mode: UInt8, bytes: [UInt8]) -> [String] {
+        var result: [String] = []
+
+        switch mode {
+            case 0x22, 0x2E:
+                // Read/Write data by identifier: next 2 bytes are DID
+                guard bytes.count >= 3 else { break }
+                let did = UInt16(bytes[1]) << 8 | UInt16(bytes[2])
+                let didHex = String(format: "%04X", did)
+                if let name = self.didDescriptions[did] {
+                    result.append("DID \(didHex): \(name)")
+                } else {
+                    result.append("DID \(didHex)")
+                }
+
+            case 0x27:
+                // Security access: odd = request seed, even = send key
+                guard bytes.count >= 2 else { break }
+                let subFn = bytes[1] & 0x7F
+                let level = (subFn + 1) / 2
+                let step = subFn.isMultiple(of: 2) ? "Send key" : "Request seed"
+                result.append("\(step) (level \(level))")
+
+            case 0x31:
+                // Routine control: sub-function + 2-byte routine ID
+                guard bytes.count >= 2 else { break }
+                let subFn = bytes[1] & 0x7F
+                if let desc = self.udsSubFunctions[0x31]?[subFn] {
+                    result.append(desc)
+                }
+                if bytes.count >= 4 {
+                    let routineId = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
+                    result.append("Routine ID \(String(format: "%04X", routineId))")
+                }
+
+            default:
+                guard bytes.count >= 2 else { break }
+                let subFn = bytes[1] & 0x7F
+                if let desc = self.udsSubFunctions[mode]?[subFn] {
+                    result.append(desc)
+                }
+        }
+
+        return result
+    }
+
     func annotateOutgoing(_ line: String) -> AnalyzerOutput? {
 
         let upper = line.uppercased()
@@ -1326,16 +1437,26 @@ final class OBD2Analyzer {
         let protocolName = isOBD2 ? "OBD-II" : "UDS/KWP"
         let modeDescriptions = isOBD2 ? self.obd2ModeDescriptions : self.udsModeDescriptions
 
-        if let description = modeDescriptions[mode] {
-            details.append(description)
-        }
-
         if isOBD2 && bytes.count > 1 {
             let pid = bytes[1]
             if let info = self.pidDatabase[pid] {
                 details.append("PID \(String(format: "%02X", pid)): \(info.description)")
             } else {
                 details.append("PID \(String(format: "%02X", pid))")
+            }
+        }
+
+        if let description = modeDescriptions[mode] {
+            if !isOBD2 {
+                let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+                details.append(([description] + subParts).joined(separator: " · "))
+            } else {
+                details.append(description)
+            }
+        } else if !isOBD2 {
+            let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+            if !subParts.isEmpty {
+                details.append(subParts.joined(separator: " · "))
             }
         }
 
@@ -1371,7 +1492,18 @@ final class OBD2Analyzer {
         let modeDescriptions = isOBD2 ? self.obd2ModeDescriptions : self.udsModeDescriptions
 
         if let description = modeDescriptions[mode] {
-            details.append("Mode \(String(format: "%02X", mode)): \(description)")
+            let modePrefix = "Mode \(String(format: "%02X", mode)): \(description)"
+            if !isOBD2 {
+                let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+                details.append(([modePrefix] + subParts).joined(separator: " · "))
+            } else {
+                details.append(modePrefix)
+            }
+        } else if !isOBD2 {
+            let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+            if !subParts.isEmpty {
+                details.append(subParts.joined(separator: " · "))
+            }
         }
 
         return AnalyzerOutput(headline: "✅ ISO-TP: \(protocolName) Complete Message", details: details)
@@ -1563,8 +1695,18 @@ final class OBD2Analyzer {
         }
 
         if let description = modeDescriptions[mode] {
-            details.append("Mode \(String(format: "%02X", mode)): \(description)")
-            return AnalyzerOutput(headline: "\(protocolName) response", details: details)
+            let modePrefix = "Mode \(String(format: "%02X", mode)): \(description)"
+            if !isOBD2 {
+                let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+                details.append(([modePrefix] + subParts).joined(separator: " · "))
+            } else {
+                details.append(modePrefix)
+            }
+        } else if !isOBD2 {
+            let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+            if !subParts.isEmpty {
+                details.append(subParts.joined(separator: " · "))
+            }
         }
 
         return AnalyzerOutput(headline: "\(protocolName) response", details: details)
