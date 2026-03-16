@@ -1396,6 +1396,7 @@ final class OBD2Analyzer {
 
         var bytes = parsed.bytes
         let (extendedAddressNote, extendedAddress) = self.stripExtendedAddressIfNeeded(from: &bytes)
+        let lengthByteNote = Self.stripSingleFrameLengthByteIfNeeded(from: &bytes, header: parsed.header)
         guard bytes.count >= 2 else { return nil }
 
         let isotpKey = ISOTPKey(canId: parsed.header, extendedAddress: extendedAddress)
@@ -1412,6 +1413,7 @@ final class OBD2Analyzer {
 
             var details: [String] = []
             if let note = extendedAddressNote { details.append(note) }
+            if let note = lengthByteNote { details.append(note) }
             if isResponsePending {
                 details.append("Service 0x\(String(format: "%02X", serviceId)) response pending")
             } else {
@@ -1466,6 +1468,7 @@ final class OBD2Analyzer {
             let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             var details: [String] = []
             if let note = extendedAddressNote { details.append(note) }
+            if let note = lengthByteNote { details.append(note) }
             details.append("Hex: \(hexBytes)")
             details.append("Multi-frame message started, waiting for consecutive frames...")
             return AnalyzerOutput(
@@ -1489,6 +1492,7 @@ final class OBD2Analyzer {
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 var details: [String] = []
                 if let note = extendedAddressNote { details.append(note) }
+                if let note = lengthByteNote { details.append(note) }
                 details.append("Hex: \(hexBytes)")
                 details.append("Received consecutive frame without first frame")
                 return AnalyzerOutput(
@@ -1502,6 +1506,7 @@ final class OBD2Analyzer {
                 let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
                 var details: [String] = []
                 if let note = extendedAddressNote { details.append(note) }
+                if let note = lengthByteNote { details.append(note) }
                 details.append("Hex: \(hexBytes)")
                 details.append("Expected sequence \(state.nextSequence), got \(sequence)")
                 return AnalyzerOutput(
@@ -1523,6 +1528,7 @@ final class OBD2Analyzer {
                 let progress = "\(state.buffer.count)/\(state.totalLength)"
                 var details: [String] = []
                 if let note = extendedAddressNote { details.append(note) }
+                if let note = lengthByteNote { details.append(note) }
                 details.append("Hex: \(hexBytes)")
                 details.append("Sequence \(sequence), waiting for more frames...")
                 return AnalyzerOutput(
@@ -1546,6 +1552,7 @@ final class OBD2Analyzer {
 
         var details: [String] = []
         if let note = extendedAddressNote { details.append(note) }
+        if let note = lengthByteNote { details.append(note) }
         details.append("Hex: \(hexBytes)")
         details.append("ASCII: \(ascii)")
 
@@ -1632,6 +1639,23 @@ final class OBD2Analyzer {
             )
         }
         return (nil, nil)
+    }
+
+    private static func stripSingleFrameLengthByteIfNeeded(from bytes: inout [UInt8], header: UInt32?) -> String? {
+        guard header != nil, let first = bytes.first else { return nil }
+
+        let payloadLength = Int(first & 0x0F)
+        guard first >> 4 == 0x0, (1...7).contains(payloadLength), bytes.count >= payloadLength + 1 else {
+            return nil
+        }
+
+        let candidatePayload = Array(bytes.dropFirst().prefix(payloadLength))
+        guard let serviceByte = candidatePayload.first, serviceByte == 0x7F || (serviceByte & 0x40) == 0x40 else {
+            return nil
+        }
+
+        bytes = candidatePayload
+        return "Single-frame length byte 0x\(String(format: "%02X", first)) stripped before decoding"
     }
 
     private static func looksLikeISOTPFrame(_ bytes: [UInt8]) -> Bool {
