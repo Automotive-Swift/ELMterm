@@ -2286,7 +2286,6 @@ final class TerminalUI {
             "\(self.bold)ELMterm\(self.reset)",
             "\(self.dim)prompt \(visiblePrompt.isEmpty ? ">" : visiblePrompt.trimmed)\(self.reset)",
             "\(self.dim)cursor \(cursor)\(self.reset)",
-            "\(self.dim)term \(self.cols)x\(self.rows)\(self.reset)",
         ]
     }
 
