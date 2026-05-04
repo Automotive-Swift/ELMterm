@@ -1,4 +1,5 @@
 import ArgumentParser
+import CELMtermShim
 import CornucopiaStreams
 import Foundation
 
@@ -2133,19 +2134,11 @@ final class OBD2Analyzer {
 
 // MARK: - Helpers
 
-/// Typed shim for the variadic ioctl(2) — Swift can't bridge C variadics
-/// directly, so we re-declare the one form we need. The `request` parameter is
-/// a `UInt` to match Darwin's `unsigned long`.
-@_silgen_name("ioctl")
-private func _elmtermIoctlWinsize(_ fd: Int32, _ request: UInt, _ arg: UnsafeMutablePointer<winsize>) -> Int32
-
-/// `TIOCGWINSZ` from <sys/ttycom.h> on Darwin: `_IOR('t', 104, struct winsize)`
-/// = `0x40000000 | (sizeof(winsize) << 16) | ('t' << 8) | 104` = `0x40087468`.
-private let _elmtermTIOCGWINSZ: UInt = 0x40087468
-
-/// Bottom-anchored TUI: keeps the prompt pinned to the last row while logs
-/// scroll above it. Mirrors cantalk's layout, but repaints the visible scroll
-/// area explicitly because tmux can be picky about DECSTBM state.
+/// Bottom-anchored TUI: pins a 3-row prompt strip (top ruler, input line,
+/// bottom ruler) to the last rows while a DECSTBM scroll region above it
+/// receives all log output. Mirrors cantalk's approach — log lines are
+/// printed at the bottom of the region so the terminal scrolls them up
+/// naturally, which also feeds the host terminal's own scrollback.
 /// All writes must be funnelled through the controller's output queue.
 final class TerminalUI {
 
@@ -2158,7 +2151,6 @@ final class TerminalUI {
     private let cyan = "\u{001B}[36m"
     private let bold = "\u{001B}[1m"
     private let reset = "\u{001B}[0m"
-    private var transcriptLines: [String] = []
 
     /// Try to enter bottom-anchored mode. Returns false if stdin/stdout aren't
     /// TTYs or TERM is missing/dumb — caller should keep the plain REPL.
@@ -2170,10 +2162,10 @@ final class TerminalUI {
 
         self.refreshSize()
         fputs("\u{001B}[?25l", stdout)
-        for row in 1...self.rows {
-            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
-        }
-        self.redrawScrollArea()
+        self.installScrollRegion()
+        // Park the cursor at the bottom of the scroll region so the first
+        // writeLine accumulates downward before scrolling kicks in.
+        fputs("\u{001B}[\(self.scrollBottom());1H", stdout)
         self.drawRulersInternal(prompt: "", buffer: "", cursorPos: 0)
         fputs("\u{001B}[?25h", stdout)
         fflush(stdout)
@@ -2183,8 +2175,8 @@ final class TerminalUI {
 
     func leave() {
         guard self.enabled else { return }
-        // Clear the prompt strip and leave the shell prompt on a fresh line
-        // below the transcript.
+        // Reset DECSTBM, drop a fresh line below the transcript so the user's
+        // shell prompt doesn't overwrite our last output.
         fputs("\u{001B}[r", stdout)
         fputs("\u{001B}[\(max(1, self.rows - self.promptHeight + 1));1H", stdout)
         fputs("\u{001B}[J", stdout)
@@ -2196,11 +2188,7 @@ final class TerminalUI {
     func handleResize() {
         guard self.enabled else { return }
         self.refreshSize()
-        let bottom = max(1, self.rows - self.promptHeight)
-        for row in 1...bottom {
-            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
-        }
-        self.redrawScrollArea()
+        self.installScrollRegion()
         self.drawRulersInternal(prompt: "", buffer: "", cursorPos: 0)
         fflush(stdout)
     }
@@ -2219,14 +2207,17 @@ final class TerminalUI {
             fputs("\n", stdout)
             return
         }
-        self.transcriptLines.append(line)
-        let maxRetained = max(200, (self.rows - self.promptHeight) * 4)
-        if self.transcriptLines.count > maxRetained {
-            self.transcriptLines.removeFirst(self.transcriptLines.count - maxRetained)
+        let bottom = self.scrollBottom()
+        // DECSC (ESC 7) survives DECSTBM better than CSI cursor save (CSI s).
+        fputs("\u{001B}[?25l\u{001B}\u{0037}", stdout)
+        for fragment in line.split(separator: "\n", omittingEmptySubsequences: false) {
+            fputs("\u{001B}[\(bottom);1H", stdout)
+            fputs(Self.clippedVisible(String(fragment), to: self.cols), stdout)
+            // \n at the bottom row of the scroll region scrolls the region
+            // up by one without disturbing the prompt strip below it.
+            fputs("\n", stdout)
         }
-        fputs("\u{001B}[?25l", stdout)
-        self.redrawScrollArea()
-        fputs("\u{001B}[?25h", stdout)
+        fputs("\u{001B}\u{0038}\u{001B}[?25h", stdout)
     }
 
     func drawPrompt(prompt: String, buffer: String, cursorPos: Int) {
@@ -2245,115 +2236,47 @@ final class TerminalUI {
 
     func clearScrollArea() {
         guard self.enabled else { return }
-        let bottom = max(1, self.rows - self.promptHeight)
-        self.transcriptLines.removeAll()
+        let bottom = self.scrollBottom()
         fputs("\u{001B}[?25l", stdout)
         for row in 1...bottom {
             fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
         }
+        fputs("\u{001B}[\(bottom);1H", stdout)
         fputs("\u{001B}[?25h", stdout)
     }
 
+    private func scrollBottom() -> Int {
+        max(1, self.rows - self.promptHeight)
+    }
+
+    private func installScrollRegion() {
+        let bottom = self.scrollBottom()
+        // Clear the scroll area so leftover content from before we set DECSTBM
+        // doesn't end up frozen above the new region.
+        for row in 1...bottom {
+            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+        }
+        fputs("\u{001B}[1;\(bottom)r", stdout)
+    }
+
     private func refreshSize() {
-        var detectedRows: Int?
-        var detectedCols: Int?
-        let tmuxSize = Self.queryTmuxPaneSize()
-        if let (rows, cols) = tmuxSize {
-            detectedRows = rows
-            detectedCols = cols
-        } else if let (rows, cols) = Self.queryWindowSize() {
-            detectedRows = detectedRows.map { min($0, rows) } ?? rows
-            detectedCols = detectedCols.map { min($0, cols) } ?? cols
-        }
-        if tmuxSize == nil {
-            let environment = ProcessInfo.processInfo.environment
-            if let lines = environment["LINES"].flatMap(Int.init), lines > 0 {
-                detectedRows = detectedRows.map { min($0, lines) } ?? lines
-            }
-            if let columns = environment["COLUMNS"].flatMap(Int.init), columns > 0 {
-                detectedCols = detectedCols.map { min($0, columns) } ?? columns
-            }
-        }
-        self.rows = max(self.promptHeight + 2, detectedRows ?? self.rows)
-        self.cols = max(20, detectedCols ?? self.cols)
-    }
-
-    private static func queryTmuxPaneSize() -> (Int, Int)? {
-        let environment = ProcessInfo.processInfo.environment
-        guard let pane = environment["TMUX_PANE"], !pane.isEmpty else { return nil }
-
-        let candidates = [
-            "/opt/homebrew/bin/tmux",
-            "/usr/local/bin/tmux",
-            "/usr/bin/tmux",
-        ]
-        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-            if let size = Self.runTmuxPaneSize(tmuxPath: candidate, pane: pane) {
-                return size
-            }
-        }
-        return Self.runTmuxPaneSize(tmuxPath: "/usr/bin/env", pane: pane, usesEnv: true)
-    }
-
-    private static func runTmuxPaneSize(tmuxPath: String, pane: String, usesEnv: Bool = false) -> (Int, Int)? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tmuxPath)
-        process.arguments = usesEnv
-            ? ["tmux", "display-message", "-pt", pane, "#{pane_height} #{pane_width}"]
-            : ["display-message", "-pt", pane, "#{pane_height} #{pane_width}"]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard process.terminationStatus == 0 else { return nil }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        let parts = output
-            .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
-            .compactMap { Int($0) }
-        guard parts.count >= 2, parts[0] > 0, parts[1] > 0 else { return nil }
-        return (parts[0], parts[1])
+        guard let (rows, cols) = Self.queryWindowSize() else { return }
+        self.rows = max(self.promptHeight + 2, rows)
+        self.cols = max(20, cols)
     }
 
     private func ruleLine(_ segments: [String]) -> String {
         let separator = "\(self.dim) · \(self.reset)"
         let body = "  " + segments.joined(separator: separator) + "  "
         let visible = Self.visibleLength(of: body)
-        // Avoid writing into the last terminal cell: many terminals, and tmux
-        // in particular, auto-wrap from that cell and turn one ruler repaint
-        // into a screen full of horizontal lines.
-        let targetWidth = max(1, self.cols - 1)
-        let prefix = "\(self.dim)--\(self.reset)"
+        let targetWidth = max(1, self.cols)
+        let prefix = "\(self.dim)──\(self.reset)"
         if visible + 2 >= targetWidth {
             return Self.clippedVisible(prefix + body + self.reset, to: targetWidth)
         }
         let right = max(0, targetWidth - visible - 2)
-        let line = "\(prefix)\(body)\(self.dim)\(String(repeating: "-", count: right))\(self.reset)"
+        let line = "\(prefix)\(body)\(self.dim)\(String(repeating: "─", count: right))\(self.reset)"
         return Self.clippedVisible(line, to: targetWidth)
-    }
-
-    private func redrawScrollArea() {
-        let bottom = max(1, self.rows - self.promptHeight)
-        let visible = self.transcriptLines.suffix(bottom)
-        let padding = bottom - visible.count
-        if padding > 0 {
-            for row in 1...padding {
-                fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
-            }
-        }
-        for (offset, line) in visible.enumerated() {
-            let row = padding + offset + 1
-            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
-            fputs(Self.clippedVisible(line, to: max(1, self.cols - 1)), stdout)
-        }
     }
 
     private func topSegments(prompt: String, buffer: String, cursorPos: Int) -> [String] {
@@ -2363,6 +2286,7 @@ final class TerminalUI {
             "\(self.bold)ELMterm\(self.reset)",
             "\(self.dim)prompt \(visiblePrompt.isEmpty ? ">" : visiblePrompt.trimmed)\(self.reset)",
             "\(self.dim)cursor \(cursor)\(self.reset)",
+            "\(self.dim)term \(self.cols)x\(self.rows)\(self.reset)",
         ]
     }
 
@@ -2374,17 +2298,17 @@ final class TerminalUI {
         ]
     }
 
-    /// Ask the kernel for the window size via TIOCGWINSZ. Swift can't import
-    /// the variadic ioctl(2) prototype, so we declare a typed shim ourselves.
+    /// Ask the kernel for the window size via TIOCGWINSZ. Routed through a C
+    /// shim because ioctl(2) is variadic and the Apple arm64 ABI uses
+    /// different calling conventions for variadic vs. non-variadic functions
+    /// — calling it via `@_silgen_name` produces garbage on arm64.
     private static func queryWindowSize() -> (Int, Int)? {
         // Try stdout, stderr, stdin in turn — any of them might be the TTY.
         for fd in [STDOUT_FILENO, STDERR_FILENO, STDIN_FILENO] {
-            var ws = winsize()
-            let result = withUnsafeMutablePointer(to: &ws) { ptr -> Int32 in
-                _elmtermIoctlWinsize(fd, _elmtermTIOCGWINSZ, ptr)
-            }
-            if result == 0, ws.ws_row > 0, ws.ws_col > 0 {
-                return (Int(ws.ws_row), Int(ws.ws_col))
+            var rows: UInt16 = 0
+            var cols: UInt16 = 0
+            if elmterm_get_winsize(fd, &rows, &cols) == 0, rows > 0, cols > 0 {
+                return (Int(rows), Int(cols))
             }
         }
         return nil
