@@ -98,6 +98,9 @@ struct ELMterm: AsyncParsableCommand {
     @Flag(name: .long, help: "Show a timestamp prefix for every RX/TX line.")
     var timestamps: Bool = false
 
+    @Flag(name: .long, help: "Disable the bottom-anchored TUI (use a scrolling line-by-line REPL instead).")
+    var noTui: Bool = false
+
     @Option(name: .long, help: "Write communication log to the specified file.")
     var log: String?
 
@@ -128,7 +131,8 @@ struct ELMterm: AsyncParsableCommand {
             timestamps: self.timestamps,
             annotationIndent: 2,
             colorPalette: palette,
-            logFileURL: logFileURL
+            logFileURL: logFileURL,
+            useTUI: !self.noTui
         )
 
         let controller = TerminalController(configuration: configuration, analyzer: self.plain ? nil : OBD2Analyzer())
@@ -207,6 +211,7 @@ struct TerminalConfiguration {
     let annotationIndent: Int
     let colorPalette: ColorPalette
     let logFileURL: URL?
+    let useTUI: Bool
 }
 
 /// Supported command terminators for the REPL.
@@ -295,6 +300,7 @@ final class TerminalController: NSObject {
     private let promptStateQueue = DispatchQueue(label: "ELMterm.prompt.state", attributes: .concurrent)
     private var lineEditingActive = false
     private var activeInputBuffer = ""
+    private var activeCursorPos = 0
     private let transmitLock = NSLock()
     private var pendingWriteBuffer = Data()
     private let echoLock = NSLock()
@@ -304,6 +310,9 @@ final class TerminalController: NSObject {
     private var streamsScheduledOnRunLoop = false
 
     private var communicationLogger: CommunicationLogger?
+
+    private var tui: TerminalUI?
+    private var winchSource: DispatchSourceSignal?
 
     init(configuration: TerminalConfiguration, analyzer: OBD2Analyzer?) {
         self.configuration = configuration
@@ -320,6 +329,7 @@ final class TerminalController: NSObject {
         self.promptStateQueue.sync(flags: .barrier) {
             self.lineEditingActive = true
             self.activeInputBuffer = ""
+            self.activeCursorPos = 0
         }
     }
 
@@ -327,34 +337,43 @@ final class TerminalController: NSObject {
         self.promptStateQueue.sync(flags: .barrier) {
             self.lineEditingActive = false
             self.activeInputBuffer = ""
+            self.activeCursorPos = 0
         }
     }
 
-    private func updateActiveInputBuffer(_ buffer: String) {
-        self.promptStateQueue.sync(flags: .barrier) {
-            self.activeInputBuffer = buffer
+    private func snapshotPromptState() -> (active: Bool, buffer: String, cursor: Int) {
+        self.promptStateQueue.sync {
+            (self.lineEditingActive, self.activeInputBuffer, self.activeCursorPos)
         }
-    }
-
-    private func snapshotPromptState() -> (Bool, String) {
-        self.promptStateQueue.sync { (self.lineEditingActive, self.activeInputBuffer) }
     }
 
     private func emitLines(_ lines: [String]) {
         guard !lines.isEmpty else { return }
         self.outputQueue.async {
-            let (active, buffer) = self.snapshotPromptState()
-            if active {
-                // Clear the current line (active editing)
+            let state = self.snapshotPromptState()
+            if let tui = self.tui, tui.enabled {
+                for line in lines {
+                    tui.writeLine(line)
+                }
+                if state.active {
+                    tui.drawPrompt(
+                        prompt: self.configuration.prompt,
+                        buffer: state.buffer,
+                        cursorPos: state.cursor
+                    )
+                }
+                fflush(stdout)
+                return
+            }
+            if state.active {
                 fputs("\r\u{001B}[K", stdout)
             }
             for line in lines {
                 fputs(line, stdout)
                 fputs("\n", stdout)
             }
-            if active {
-                // Restore the prompt and user's input buffer
-                fputs("\(self.configuration.prompt)\(buffer)", stdout)
+            if state.active {
+                fputs("\(self.configuration.prompt)\(state.buffer)", stdout)
             }
             fflush(stdout)
         }
@@ -370,6 +389,9 @@ final class TerminalController: NSObject {
     }
 
     func start(url: URL, timeout: TimeInterval) async throws {
+
+        self.activateTUIIfPossible()
+        defer { self.deactivateTUI() }
 
         try self.prepareHistory()
         self.printStatus("Connecting to \(url.absoluteString)…")
@@ -392,6 +414,43 @@ final class TerminalController: NSObject {
         self.printStatus("Disconnected.")
     }
 
+    private func activateTUIIfPossible() {
+        guard self.configuration.useTUI else { return }
+        let tui = TerminalUI()
+        self.outputQueue.sync {
+            if tui.enter() {
+                self.tui = tui
+            }
+        }
+        guard self.tui != nil else { return }
+        let source = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: self.outputQueue)
+        source.setEventHandler { [weak self] in
+            guard let self, let tui = self.tui else { return }
+            tui.handleResize()
+            let state = self.snapshotPromptState()
+            if state.active {
+                tui.drawPrompt(
+                    prompt: self.configuration.prompt,
+                    buffer: state.buffer,
+                    cursorPos: state.cursor
+                )
+                fflush(stdout)
+            }
+        }
+        source.resume()
+        self.winchSource = source
+    }
+
+    private func deactivateTUI() {
+        self.winchSource?.cancel()
+        self.winchSource = nil
+        guard let tui = self.tui else { return }
+        self.outputQueue.sync {
+            tui.leave()
+        }
+        self.tui = nil
+    }
+
     func requestStop(reason: String? = nil) {
         guard !self.pendingShutdown else { return }
         self.pendingShutdown = true
@@ -408,7 +467,7 @@ final class TerminalController: NSObject {
     }
 
     private func readUserInput() throws -> String {
-        self.outputQueue.sync {
+        _ = self.outputQueue.sync {
             fflush(stdout)
         }
         self.beginLineEditing()
@@ -433,9 +492,7 @@ final class TerminalController: NSObject {
             tcsetattr(STDIN_FILENO, TCSAFLUSH, &originalTermios)
         }
 
-        // Display prompt
-        fputs(prompt, stdout)
-        fflush(stdout)
+        self.renderPromptLine(buffer: buffer, cursorPos: cursorPos, prompt: prompt)
 
         var escapeSequence: [UInt8] = []
 
@@ -477,15 +534,13 @@ final class TerminalController: NSObject {
                         }
                     case 67: // Right arrow
                         if cursorPos < buffer.count {
-                            fputs("\u{001B}[C", stdout)
-                            fflush(stdout)
                             cursorPos += 1
+                            self.moveCursorRelative(by: 1, buffer: buffer, cursor: cursorPos)
                         }
                     case 68: // Left arrow
                         if cursorPos > 0 {
-                            fputs("\u{001B}[D", stdout)
-                            fflush(stdout)
                             cursorPos -= 1
+                            self.moveCursorRelative(by: -1, buffer: buffer, cursor: cursorPos)
                         }
                     default:
                         break
@@ -511,14 +566,12 @@ final class TerminalController: NSObject {
             }
 
             if char == 13 || char == 10 { // CR or LF
-                fputs("\n", stdout)
-                fflush(stdout)
+                self.commitPromptLine()
                 return buffer
             }
 
             if char == 3 { // Ctrl-C
-                fputs("^C\n", stdout)
-                fflush(stdout)
+                self.emitLine("^C")
                 self.requestStop(reason: "Interrupted")
                 return ""
             }
@@ -535,14 +588,14 @@ final class TerminalController: NSObject {
                 let charStr = String(UnicodeScalar(char))
                 if cursorPos == buffer.count {
                     buffer.append(charStr)
-                    fputs(charStr, stdout)
-                    fflush(stdout)
+                    cursorPos += 1
+                    self.appendCharToPromptLine(charStr, buffer: buffer, cursor: cursorPos)
                 } else {
                     let index = buffer.index(buffer.startIndex, offsetBy: cursorPos)
                     buffer.insert(contentsOf: charStr, at: index)
+                    cursorPos += 1
                     self.redrawLine(buffer: buffer, cursorPos: cursorPos, prompt: prompt)
                 }
-                cursorPos += 1
             }
         }
     }
@@ -582,18 +635,79 @@ final class TerminalController: NSObject {
         self.redrawLine(buffer: buffer, cursorPos: cursorPos, prompt: prompt)
     }
 
+    private func renderPromptLine(buffer: String, cursorPos: Int, prompt: String) {
+        self.outputQueue.sync {
+            self.updateActiveInputLocked(buffer: buffer, cursor: cursorPos)
+            self.drawPromptLocked(buffer: buffer, cursorPos: cursorPos, prompt: prompt, fullRedraw: false)
+        }
+    }
+
     private func redrawLine(buffer: String, cursorPos: Int, prompt: String) {
-        // Clear line and redraw
-        fputs("\r\u{001B}[K", stdout)
+        self.outputQueue.sync {
+            self.updateActiveInputLocked(buffer: buffer, cursor: cursorPos)
+            self.drawPromptLocked(buffer: buffer, cursorPos: cursorPos, prompt: prompt, fullRedraw: true)
+        }
+    }
+
+    private func appendCharToPromptLine(_ charStr: String, buffer: String, cursor: Int) {
+        self.outputQueue.sync {
+            self.updateActiveInputLocked(buffer: buffer, cursor: cursor)
+            fputs(charStr, stdout)
+            fflush(stdout)
+        }
+    }
+
+    private func moveCursorRelative(by delta: Int, buffer: String, cursor: Int) {
+        guard delta != 0 else { return }
+        self.outputQueue.sync {
+            self.updateActiveInputLocked(buffer: buffer, cursor: cursor)
+            let seq = delta > 0 ? "\u{001B}[\(delta)C" : "\u{001B}[\(-delta)D"
+            fputs(seq, stdout)
+            fflush(stdout)
+        }
+    }
+
+    /// State update + stdout write must be atomic w.r.t. emitLines, otherwise
+    /// an asynchronous log can fire mid-keystroke and redraw with stale buffer.
+    /// All callers run inside `outputQueue.sync`, so the prompt-state queue is
+    /// the only thing we need to gate here.
+    private func updateActiveInputLocked(buffer: String, cursor: Int) {
+        self.promptStateQueue.sync(flags: .barrier) {
+            self.activeInputBuffer = buffer
+            self.activeCursorPos = cursor
+        }
+    }
+
+    private func drawPromptLocked(buffer: String, cursorPos: Int, prompt: String, fullRedraw: Bool) {
+        if let tui = self.tui, tui.enabled {
+            tui.drawPrompt(prompt: prompt, buffer: buffer, cursorPos: cursorPos)
+            fflush(stdout)
+            return
+        }
+        if fullRedraw {
+            fputs("\r\u{001B}[K", stdout)
+        }
         fputs(prompt, stdout)
         fputs(buffer, stdout)
-
-        // Move cursor to correct position
         let distanceFromEnd = buffer.count - cursorPos
         if distanceFromEnd > 0 {
             fputs("\u{001B}[\(distanceFromEnd)D", stdout)
         }
         fflush(stdout)
+    }
+
+    private func commitPromptLine() {
+        self.outputQueue.sync {
+            if let tui = self.tui, tui.enabled {
+                // Cantalk's pattern: blank the prompt on Enter and let
+                // printOutgoing render the actual command into the scroll area.
+                tui.drawPrompt(prompt: self.configuration.prompt, buffer: "", cursorPos: 0)
+                fflush(stdout)
+                return
+            }
+            fputs("\n", stdout)
+            fflush(stdout)
+        }
     }
 
     enum SimpleReadLineError: Error {
@@ -714,8 +828,20 @@ final class TerminalController: NSObject {
             case .history(let limit):
                 self.printHistory(limit: limit)
             case .clear:
-                fputs("\u{001B}[2J\u{001B}[H", stdout)  // Clear screen and move to home
-                fflush(stdout)
+                self.outputQueue.sync {
+                    if let tui = self.tui, tui.enabled {
+                        tui.clearScrollArea()
+                        let state = self.snapshotPromptState()
+                        tui.drawPrompt(
+                            prompt: self.configuration.prompt,
+                            buffer: state.buffer,
+                            cursorPos: state.cursor
+                        )
+                    } else {
+                        fputs("\u{001B}[2J\u{001B}[H", stdout)
+                    }
+                    fflush(stdout)
+                }
             case .analyzer(let toggle):
                 if let toggle {
                     self.annotationEnabled = toggle
@@ -2007,6 +2133,328 @@ final class OBD2Analyzer {
 
 // MARK: - Helpers
 
+/// Typed shim for the variadic ioctl(2) — Swift can't bridge C variadics
+/// directly, so we re-declare the one form we need. The `request` parameter is
+/// a `UInt` to match Darwin's `unsigned long`.
+@_silgen_name("ioctl")
+private func _elmtermIoctlWinsize(_ fd: Int32, _ request: UInt, _ arg: UnsafeMutablePointer<winsize>) -> Int32
+
+/// `TIOCGWINSZ` from <sys/ttycom.h> on Darwin: `_IOR('t', 104, struct winsize)`
+/// = `0x40000000 | (sizeof(winsize) << 16) | ('t' << 8) | 104` = `0x40087468`.
+private let _elmtermTIOCGWINSZ: UInt = 0x40087468
+
+/// Bottom-anchored TUI: keeps the prompt pinned to the last row while logs
+/// scroll above it. Mirrors cantalk's layout, but repaints the visible scroll
+/// area explicitly because tmux can be picky about DECSTBM state.
+/// All writes must be funnelled through the controller's output queue.
+final class TerminalUI {
+
+    private(set) var rows: Int = 24
+    private(set) var cols: Int = 80
+    /// 3 rows reserved at the bottom: top ruler, input line, bottom ruler.
+    let promptHeight: Int = 3
+    private(set) var enabled: Bool = false
+    private let dim = "\u{001B}[2m"
+    private let cyan = "\u{001B}[36m"
+    private let bold = "\u{001B}[1m"
+    private let reset = "\u{001B}[0m"
+    private var transcriptLines: [String] = []
+
+    /// Try to enter bottom-anchored mode. Returns false if stdin/stdout aren't
+    /// TTYs or TERM is missing/dumb — caller should keep the plain REPL.
+    @discardableResult
+    func enter() -> Bool {
+        guard isatty(STDIN_FILENO) != 0, isatty(STDOUT_FILENO) != 0 else { return false }
+        let term = ProcessInfo.processInfo.environment["TERM"] ?? ""
+        if term.isEmpty || term == "dumb" { return false }
+
+        self.refreshSize()
+        fputs("\u{001B}[?25l", stdout)
+        for row in 1...self.rows {
+            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+        }
+        self.redrawScrollArea()
+        self.drawRulersInternal(prompt: "", buffer: "", cursorPos: 0)
+        fputs("\u{001B}[?25h", stdout)
+        fflush(stdout)
+        self.enabled = true
+        return true
+    }
+
+    func leave() {
+        guard self.enabled else { return }
+        // Clear the prompt strip and leave the shell prompt on a fresh line
+        // below the transcript.
+        fputs("\u{001B}[r", stdout)
+        fputs("\u{001B}[\(max(1, self.rows - self.promptHeight + 1));1H", stdout)
+        fputs("\u{001B}[J", stdout)
+        fputs("\u{001B}[?25h", stdout)
+        fflush(stdout)
+        self.enabled = false
+    }
+
+    func handleResize() {
+        guard self.enabled else { return }
+        self.refreshSize()
+        let bottom = max(1, self.rows - self.promptHeight)
+        for row in 1...bottom {
+            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+        }
+        self.redrawScrollArea()
+        self.drawRulersInternal(prompt: "", buffer: "", cursorPos: 0)
+        fflush(stdout)
+    }
+
+    /// Paint the two horizontal rulers framing the input row.
+    private func drawRulersInternal(prompt: String, buffer: String, cursorPos: Int) {
+        let topRow = self.rows - 2
+        let bottomRow = self.rows
+        fputs("\u{001B}[\(topRow);1H\u{001B}[2K\(self.ruleLine(self.topSegments(prompt: prompt, buffer: buffer, cursorPos: cursorPos)))", stdout)
+        fputs("\u{001B}[\(bottomRow);1H\u{001B}[2K\(self.ruleLine(self.hintSegments()))", stdout)
+    }
+
+    func writeLine(_ line: String) {
+        guard self.enabled else {
+            fputs(line, stdout)
+            fputs("\n", stdout)
+            return
+        }
+        self.transcriptLines.append(line)
+        let maxRetained = max(200, (self.rows - self.promptHeight) * 4)
+        if self.transcriptLines.count > maxRetained {
+            self.transcriptLines.removeFirst(self.transcriptLines.count - maxRetained)
+        }
+        fputs("\u{001B}[?25l", stdout)
+        self.redrawScrollArea()
+        fputs("\u{001B}[?25h", stdout)
+    }
+
+    func drawPrompt(prompt: String, buffer: String, cursorPos: Int) {
+        guard self.enabled else { return }
+        let inputRow = max(1, self.rows - 1)
+        let promptLen = Self.visibleLength(of: prompt)
+        let col = max(1, 1 + promptLen + cursorPos)
+        fputs("\u{001B}[?25l", stdout)
+        self.drawRulersInternal(prompt: prompt, buffer: buffer, cursorPos: cursorPos)
+        fputs("\u{001B}[\(inputRow);1H\u{001B}[2K", stdout)
+        fputs(prompt, stdout)
+        fputs(buffer, stdout)
+        fputs("\u{001B}[\(inputRow);\(col)H", stdout)
+        fputs("\u{001B}[?25h", stdout)
+    }
+
+    func clearScrollArea() {
+        guard self.enabled else { return }
+        let bottom = max(1, self.rows - self.promptHeight)
+        self.transcriptLines.removeAll()
+        fputs("\u{001B}[?25l", stdout)
+        for row in 1...bottom {
+            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+        }
+        fputs("\u{001B}[?25h", stdout)
+    }
+
+    private func refreshSize() {
+        var detectedRows: Int?
+        var detectedCols: Int?
+        let tmuxSize = Self.queryTmuxPaneSize()
+        if let (rows, cols) = tmuxSize {
+            detectedRows = rows
+            detectedCols = cols
+        } else if let (rows, cols) = Self.queryWindowSize() {
+            detectedRows = detectedRows.map { min($0, rows) } ?? rows
+            detectedCols = detectedCols.map { min($0, cols) } ?? cols
+        }
+        if tmuxSize == nil {
+            let environment = ProcessInfo.processInfo.environment
+            if let lines = environment["LINES"].flatMap(Int.init), lines > 0 {
+                detectedRows = detectedRows.map { min($0, lines) } ?? lines
+            }
+            if let columns = environment["COLUMNS"].flatMap(Int.init), columns > 0 {
+                detectedCols = detectedCols.map { min($0, columns) } ?? columns
+            }
+        }
+        self.rows = max(self.promptHeight + 2, detectedRows ?? self.rows)
+        self.cols = max(20, detectedCols ?? self.cols)
+    }
+
+    private static func queryTmuxPaneSize() -> (Int, Int)? {
+        let environment = ProcessInfo.processInfo.environment
+        guard let pane = environment["TMUX_PANE"], !pane.isEmpty else { return nil }
+
+        let candidates = [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ]
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            if let size = Self.runTmuxPaneSize(tmuxPath: candidate, pane: pane) {
+                return size
+            }
+        }
+        return Self.runTmuxPaneSize(tmuxPath: "/usr/bin/env", pane: pane, usesEnv: true)
+    }
+
+    private static func runTmuxPaneSize(tmuxPath: String, pane: String, usesEnv: Bool = false) -> (Int, Int)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tmuxPath)
+        process.arguments = usesEnv
+            ? ["tmux", "display-message", "-pt", pane, "#{pane_height} #{pane_width}"]
+            : ["display-message", "-pt", pane, "#{pane_height} #{pane_width}"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+        let parts = output
+            .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+            .compactMap { Int($0) }
+        guard parts.count >= 2, parts[0] > 0, parts[1] > 0 else { return nil }
+        return (parts[0], parts[1])
+    }
+
+    private func ruleLine(_ segments: [String]) -> String {
+        let separator = "\(self.dim) · \(self.reset)"
+        let body = "  " + segments.joined(separator: separator) + "  "
+        let visible = Self.visibleLength(of: body)
+        // Avoid writing into the last terminal cell: many terminals, and tmux
+        // in particular, auto-wrap from that cell and turn one ruler repaint
+        // into a screen full of horizontal lines.
+        let targetWidth = max(1, self.cols - 1)
+        let prefix = "\(self.dim)--\(self.reset)"
+        if visible + 2 >= targetWidth {
+            return Self.clippedVisible(prefix + body + self.reset, to: targetWidth)
+        }
+        let right = max(0, targetWidth - visible - 2)
+        let line = "\(prefix)\(body)\(self.dim)\(String(repeating: "-", count: right))\(self.reset)"
+        return Self.clippedVisible(line, to: targetWidth)
+    }
+
+    private func redrawScrollArea() {
+        let bottom = max(1, self.rows - self.promptHeight)
+        let visible = self.transcriptLines.suffix(bottom)
+        let padding = bottom - visible.count
+        if padding > 0 {
+            for row in 1...padding {
+                fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+            }
+        }
+        for (offset, line) in visible.enumerated() {
+            let row = padding + offset + 1
+            fputs("\u{001B}[\(row);1H\u{001B}[2K", stdout)
+            fputs(Self.clippedVisible(line, to: max(1, self.cols - 1)), stdout)
+        }
+    }
+
+    private func topSegments(prompt: String, buffer: String, cursorPos: Int) -> [String] {
+        let visiblePrompt = Self.stripANSI(from: prompt)
+        let cursor = "\(cursorPos)/\(buffer.count)"
+        return [
+            "\(self.bold)ELMterm\(self.reset)",
+            "\(self.dim)prompt \(visiblePrompt.isEmpty ? ">" : visiblePrompt.trimmed)\(self.reset)",
+            "\(self.dim)cursor \(cursor)\(self.reset)",
+        ]
+    }
+
+    private func hintSegments() -> [String] {
+        [
+            "\(self.cyan):help\(self.reset)",
+            "\(self.cyan)↑↓\(self.reset)\(self.dim) history\(self.reset)",
+            "\(self.cyan)Ctrl-C\(self.reset)\(self.dim) exit\(self.reset)",
+        ]
+    }
+
+    /// Ask the kernel for the window size via TIOCGWINSZ. Swift can't import
+    /// the variadic ioctl(2) prototype, so we declare a typed shim ourselves.
+    private static func queryWindowSize() -> (Int, Int)? {
+        // Try stdout, stderr, stdin in turn — any of them might be the TTY.
+        for fd in [STDOUT_FILENO, STDERR_FILENO, STDIN_FILENO] {
+            var ws = winsize()
+            let result = withUnsafeMutablePointer(to: &ws) { ptr -> Int32 in
+                _elmtermIoctlWinsize(fd, _elmtermTIOCGWINSZ, ptr)
+            }
+            if result == 0, ws.ws_row > 0, ws.ws_col > 0 {
+                return (Int(ws.ws_row), Int(ws.ws_col))
+            }
+        }
+        return nil
+    }
+
+    /// Visible length, ignoring CSI escape sequences so coloured prompts
+    /// position the cursor correctly.
+    private static func visibleLength(of text: String) -> Int {
+        var result = 0
+        var iterator = text.unicodeScalars.makeIterator()
+        while let scalar = iterator.next() {
+            if scalar == "\u{001B}" {
+                Self.consumeANSISequence(from: &iterator)
+            } else {
+                result += 1
+            }
+        }
+        return result
+    }
+
+    private static func stripANSI(from text: String) -> String {
+        var scalars: [UnicodeScalar] = []
+        var iterator = text.unicodeScalars.makeIterator()
+        while let scalar = iterator.next() {
+            if scalar == "\u{001B}" {
+                Self.consumeANSISequence(from: &iterator)
+            } else {
+                scalars.append(scalar)
+            }
+        }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func clippedVisible(_ text: String, to maxVisibleLength: Int) -> String {
+        guard maxVisibleLength > 0 else { return "" }
+        var result = String()
+        var visible = 0
+        var iterator = text.unicodeScalars.makeIterator()
+        while let scalar = iterator.next() {
+            if scalar == "\u{001B}" {
+                result.unicodeScalars.append(scalar)
+                Self.consumeANSISequence(from: &iterator) { result.unicodeScalars.append($0) }
+                continue
+            }
+            guard visible < maxVisibleLength else { break }
+            result.unicodeScalars.append(scalar)
+            visible += 1
+        }
+        return result
+    }
+
+    private static func consumeANSISequence(
+        from iterator: inout String.UnicodeScalarView.Iterator,
+        append: ((UnicodeScalar) -> Void)? = nil
+    ) {
+        guard let first = iterator.next() else { return }
+        append?(first)
+        if first == "[" {
+            while let next = iterator.next() {
+                append?(next)
+                if (0x40...0x7E).contains(next.value) {
+                    break
+                }
+            }
+        }
+    }
+}
+
+extension TerminalUI: @unchecked Sendable {}
+
 final class RunLoopStopper {
 
     private let runLoop = RunLoop.main
@@ -2041,6 +2489,8 @@ final class SignalForwarder {
         self.source = source
     }
 }
+
+extension SignalForwarder: @unchecked Sendable {}
 
 extension String {
 
@@ -2146,3 +2596,5 @@ final class CommunicationLogger {
         }
     }
 }
+
+extension CommunicationLogger: @unchecked Sendable {}
