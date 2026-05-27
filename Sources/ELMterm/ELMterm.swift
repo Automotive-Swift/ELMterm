@@ -307,6 +307,26 @@ final class TerminalController: NSObject {
     private let echoLock = NSLock()
     private var lastSentCommand: String?
 
+    /// Periodic commands quietly skip a tick while an interactive command was
+    /// issued within this window, so background polling yields the half-duplex
+    /// link rather than stacking onto an in-flight request/response exchange.
+    private static let periodicInteractiveGrace: TimeInterval = 1.0
+    private let activityLock = NSLock()
+    private var lastInteractiveSend = Date.distantPast
+    private lazy var periodicScheduler = PeriodicScheduler(
+        send: { [weak self] command in self?.enqueueCommand(command, interactive: false) },
+        shouldFire: { [weak self] in self?.mayFirePeriodicCommand() ?? false }
+    )
+
+    /// Half-duplex command pump: one command in flight, the rest queued until
+    /// the adapter's `>` prompt releases the next. Guards every field below.
+    private static let commandWatchdogTimeout: TimeInterval = 5.0
+    private let commandLock = NSLock()
+    private var commandQueue: [(command: String, interactive: Bool)] = []
+    private var inFlightCommand: String?
+    private var commandWatchdog: DispatchSourceTimer?
+    private let commandWatchdogQueue = DispatchQueue(label: "ELMterm.command.watchdog")
+
     private var pendingShutdown = false
     private var streamsScheduledOnRunLoop = false
 
@@ -459,6 +479,8 @@ final class TerminalController: NSObject {
             self.printStatus("Stopping: \(reason)")
         }
         self.keepRunning = false
+        self.periodicScheduler.removeAll()
+        self.clearCommandQueue()
         self.cleanupStreams()
     }
 
@@ -808,9 +830,11 @@ final class TerminalController: NSObject {
 
             self.history.append(trimmed)
             self.persistHistory()
-            try self.sendToAdapter(trimmed)
+            self.enqueueCommand(trimmed, interactive: true)
         }
 
+        self.periodicScheduler.removeAll()
+        self.clearCommandQueue()
         self.persistHistory()
         self.keepRunning = false
     }
@@ -853,6 +877,8 @@ final class TerminalController: NSObject {
                 self.printStatus("Analyzer \(state).")
             case .log(let action):
                 self.handleLogCommand(action)
+            case .every(let arguments):
+                self.handlePeriodicCommand(arguments)
             case .quit:
                 self.keepRunning = false
             case .saveHistory:
@@ -868,6 +894,9 @@ final class TerminalController: NSObject {
         :clear             Clear the screen
         :analyzer [on|off] Toggle or force analyzer output
         :log [path|off]    Start/stop logging or show status
+        :every             List active periodic tasks
+        :every <ival> <cmd> Send <cmd> repeatedly (e.g. :every 2s 0902)
+        :every off [id]    Stop one or all periodic tasks
         :save              Persist the in-memory history
         :quit              Exit ELMterm
         """
@@ -907,7 +936,103 @@ final class TerminalController: NSObject {
         }
     }
 
-    private func sendToAdapter(_ line: String) throws {
+    /// Queue a command for transmission. The ELM link is half-duplex: only one
+    /// command may be in flight at a time, so commands are serialized and the
+    /// next one is released only once the adapter's `>` prompt confirms the
+    /// previous response is complete (see `notePromptReceived`). A watchdog
+    /// keeps the pump alive should a prompt never arrive.
+    private func enqueueCommand(_ line: String, interactive: Bool) {
+        if interactive {
+            self.activityLock.lock()
+            self.lastInteractiveSend = Date()
+            self.activityLock.unlock()
+        }
+
+        self.commandLock.lock()
+        // Coalesce periodic ticks: never stack a second copy of the same
+        // request on the bus while an earlier one is still queued or in flight.
+        if !interactive,
+           self.inFlightCommand == line || self.commandQueue.contains(where: { $0.command == line }) {
+            self.commandLock.unlock()
+            return
+        }
+        self.commandQueue.append((command: line, interactive: interactive))
+        self.commandLock.unlock()
+
+        self.pumpNextCommand()
+    }
+
+    private func pumpNextCommand() {
+        self.commandLock.lock()
+        guard self.inFlightCommand == nil, !self.commandQueue.isEmpty else {
+            self.commandLock.unlock()
+            return
+        }
+        guard !self.pendingShutdown, self.outputStream?.streamStatus == .open else {
+            self.commandQueue.removeAll()
+            self.commandLock.unlock()
+            return
+        }
+        let next = self.commandQueue.removeFirst()
+        self.inFlightCommand = next.command
+        self.startCommandWatchdogLocked()
+        self.commandLock.unlock()
+
+        self.writeCommand(next.command)
+    }
+
+    /// Called when the adapter emits its `>` prompt, signalling that the
+    /// current command's response is complete and the next may be released.
+    private func notePromptReceived() {
+        self.commandLock.lock()
+        let wasInFlight = self.inFlightCommand != nil
+        self.inFlightCommand = nil
+        self.cancelCommandWatchdogLocked()
+        self.commandLock.unlock()
+        guard wasInFlight else { return }
+        self.pumpNextCommand()
+    }
+
+    private func clearCommandQueue() {
+        self.commandLock.lock()
+        self.commandQueue.removeAll()
+        self.inFlightCommand = nil
+        self.cancelCommandWatchdogLocked()
+        self.commandLock.unlock()
+    }
+
+    /// Drop queued periodic commands so a stopped task can't fire once more.
+    private func purgePeriodicCommands() {
+        self.commandLock.lock()
+        self.commandQueue.removeAll { !$0.interactive }
+        self.commandLock.unlock()
+    }
+
+    private func startCommandWatchdogLocked() {
+        self.cancelCommandWatchdogLocked()
+        let timer = DispatchSource.makeTimerSource(queue: self.commandWatchdogQueue)
+        timer.schedule(deadline: .now() + Self.commandWatchdogTimeout)
+        timer.setEventHandler { [weak self] in
+            self?.handleCommandWatchdog()
+        }
+        self.commandWatchdog = timer
+        timer.resume()
+    }
+
+    private func cancelCommandWatchdogLocked() {
+        self.commandWatchdog?.cancel()
+        self.commandWatchdog = nil
+    }
+
+    private func handleCommandWatchdog() {
+        self.commandLock.lock()
+        self.inFlightCommand = nil
+        self.cancelCommandWatchdogLocked()
+        self.commandLock.unlock()
+        self.pumpNextCommand()
+    }
+
+    private func writeCommand(_ line: String) {
         guard !self.pendingShutdown, self.outputStream?.streamStatus == .open else { return }
 
         self.echoLock.lock()
@@ -988,6 +1113,77 @@ final class TerminalController: NSObject {
         }
     }
 
+    private func mayFirePeriodicCommand() -> Bool {
+        guard self.keepRunning,
+              !self.pendingShutdown,
+              self.outputStream?.streamStatus == .open else { return false }
+        self.activityLock.lock()
+        let last = self.lastInteractiveSend
+        self.activityLock.unlock()
+        return Date().timeIntervalSince(last) >= Self.periodicInteractiveGrace
+    }
+
+    private func handlePeriodicCommand(_ arguments: [String]) {
+
+        guard let first = arguments.first else {
+            self.printActivePeriodicTasks()
+            return
+        }
+
+        let keyword = first.lowercased()
+        if keyword == "off" || keyword == "stop" {
+            guard let idArgument = arguments.dropFirst().first else {
+                self.periodicScheduler.removeAll()
+                self.purgePeriodicCommands()
+                self.printStatus("Stopped all periodic tasks.")
+                return
+            }
+            guard let id = Int(idArgument) else {
+                self.emitError("Invalid task id: \(idArgument)")
+                return
+            }
+            if self.periodicScheduler.remove(id: id) {
+                self.printStatus("Stopped periodic task #\(id).")
+            } else {
+                self.printStatus("No periodic task #\(id).")
+            }
+            return
+        }
+
+        guard let interval = PeriodicScheduler.parseInterval(first) else {
+            self.emitError("Invalid interval '\(first)'. Use e.g. 2s, 500ms, 1m.")
+            return
+        }
+        guard interval >= PeriodicScheduler.minimumInterval else {
+            self.emitError("Interval too short (minimum \(PeriodicScheduler.describe(PeriodicScheduler.minimumInterval))).")
+            return
+        }
+        let command = arguments.dropFirst().joined(separator: " ").trimmed
+        guard !command.isEmpty else {
+            self.emitError("Provide a command to send, e.g. :every 2s 0902")
+            return
+        }
+
+        let entry = self.periodicScheduler.add(interval: interval, command: command)
+        self.printStatus("Periodic task #\(entry.id): sending '\(command)' every \(PeriodicScheduler.describe(interval)).")
+    }
+
+    private func printActivePeriodicTasks() {
+        let entries = self.periodicScheduler.activeEntries
+        guard !entries.isEmpty else {
+            self.printStatus("No active periodic tasks.")
+            return
+        }
+        let lines = entries.map { entry in
+            "[\(entry.id)] every \(PeriodicScheduler.describe(entry.interval))  →  \(entry.command)"
+        }
+        self.emitLines(lines)
+    }
+
+    private func emitError(_ message: String) {
+        self.emitLine("\(self.colorPalette.error)\(message)\(ColorPalette.reset)")
+    }
+
     private func flushPendingWritesSafely() {
         do {
             try self.flushPendingWrites()
@@ -1050,11 +1246,13 @@ final class TerminalController: NSObject {
         let promptByte: UInt8 = 0x3E // ">"
         let cr: UInt8 = 0x0D
         let lf: UInt8 = 0x0A
+        var sawPrompt = false
 
         while !self.incomingBuffer.isEmpty {
             // The ELM327 prompt indicates end of a response. Swallow all leading prompt characters.
             while !self.incomingBuffer.isEmpty && self.incomingBuffer.first == promptByte {
                 self.incomingBuffer.removeFirst()
+                sawPrompt = true
             }
 
             guard !self.incomingBuffer.isEmpty else { break }
@@ -1078,6 +1276,12 @@ final class TerminalController: NSObject {
             if !lineData.isEmpty {
                 self.emitLine(from: lineData)
             }
+        }
+
+        // Releasing the next queued command only after the prompt keeps the
+        // half-duplex link clean and lets each response be fully processed.
+        if sawPrompt {
+            self.notePromptReceived()
         }
     }
 
@@ -1206,6 +1410,7 @@ private enum MetaCommand {
     case clear
     case analyzer(Bool?)
     case log(LogAction)
+    case every(arguments: [String])
     case quit
     case saveHistory
 
@@ -1249,6 +1454,8 @@ private enum MetaCommand {
                 } else {
                     self = .log(.status)
                 }
+            case "every", "periodic":
+                self = .every(arguments: rawComponents.dropFirst().map(String.init))
             case "quit", "exit":
                 self = .quit
             case "save":
@@ -1266,6 +1473,7 @@ private enum MetaCommand {
             ":clear",
             ":analyzer",
             ":log",
+            ":every",
             ":save",
             ":quit",
         ]
