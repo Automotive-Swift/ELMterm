@@ -351,12 +351,20 @@ If you see garbled output, ensure:
 ELMterm/
 ├── Sources/
 │   ├── ELMterm/
-│   │   ├── ELMterm.swift          # CLI, REPL, TUI, analyzer
-│   │   └── PeriodicScheduler.swift # Timer-driven periodic commands
-│   └── CELMtermShim/              # C shim (TIOCGWINSZ via ioctl)
+│   │   ├── ELMterm.swift            # @main CLI entry point (ArgumentParser)
+│   │   ├── TerminalController.swift # REPL, line editor, command pump, streams
+│   │   ├── OBD2Analyzer.swift       # OBD-II/UDS/KWP annotation + reassembly
+│   │   ├── TerminalUI.swift         # Bottom-anchored TUI
+│   │   ├── PeriodicScheduler.swift  # Timer-driven periodic commands
+│   │   ├── MetaCommand.swift        # `:` meta command parsing
+│   │   ├── Configuration.swift      # Themes, palette, terminator, preferences
+│   │   ├── CommunicationLogger.swift# File logging of TX/RX
+│   │   ├── Extensions.swift         # String/Data helpers
+│   │   └── Support.swift            # Run-loop + signal plumbing
+│   └── CELMtermShim/                # C shim (TIOCGWINSZ via ioctl)
 ├── Tests/
-│   └── ELMtermTests/              # Analyzer unit tests
-├── Package.swift                  # Swift package manifest
+│   └── ELMtermTests/                # Analyzer unit tests
+├── Package.swift                    # Swift package manifest
 ├── README.md
 └── LICENSE
 ```

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-SwiftPM drives the layout: `Package.swift` defines the executable target plus `CornucopiaStreams` and `swift-argument-parser`. Runtime code lives in `Sources/ELMterm/` — `ELMterm.swift` (CLI, REPL, bottom-anchored TUI, half-duplex command pump, OBD/UDS analyzer) and `PeriodicScheduler.swift` (timer-driven `:every` commands) — with a small C shim in `Sources/CELMtermShim/` for `TIOCGWINSZ`. Build products land under `.build/`; keep it untracked. Add modules by extending `Package.swift` and mirroring folders under `Sources/` or `Tests/` so protocol decoders, transports, and UI helpers stay isolated.
+SwiftPM drives the layout: `Package.swift` defines the executable target plus `CornucopiaStreams` and `swift-argument-parser`. Runtime code lives in `Sources/ELMterm/`, one type per file: `ELMterm.swift` (the `@main` CLI entry point), `TerminalController.swift` (REPL, line editor, half-duplex command pump, stream handling), `OBD2Analyzer.swift` (OBD-II/UDS/KWP annotation, ISO-TP and legacy multi-line reassembly), `TerminalUI.swift` (bottom-anchored TUI), `PeriodicScheduler.swift` (timer-driven `:every` commands), `MetaCommand.swift`, `Configuration.swift`, `CommunicationLogger.swift`, `Extensions.swift`, and `Support.swift`. A small C shim in `Sources/CELMtermShim/` exposes `TIOCGWINSZ`. Build products land under `.build/`; keep it untracked. Keep new types in their own file and mirror folders under `Sources/` or `Tests/` so protocol decoders, transports, and UI helpers stay isolated.
 
 ## Build, Test, and Development Commands
 - `swift build` — debug build; binary at `.build/debug/ELMterm`.
