@@ -1320,7 +1320,17 @@ final class TerminalController: NSObject {
         // Releasing the next queued command only after the prompt keeps the
         // half-duplex link clean and lets each response be fully processed.
         if sawPrompt {
+            self.finalizeReassembly()
             self.notePromptReceived()
+        }
+    }
+
+    /// The prompt marks the end of a response, which is the only completion
+    /// signal legacy (non-CAN) multi-line replies carry — flush them now.
+    private func finalizeReassembly() {
+        guard self.annotationEnabled, let analyzer = self.analyzer else { return }
+        for annotation in analyzer.finalizeReassembly() {
+            self.printAnnotation(annotation, direction: .incoming)
         }
     }
 
@@ -1549,6 +1559,23 @@ final class OBD2Analyzer {
     private var isotpStates: [ISOTPKey: ISOTPReassembly] = [:]
     private var isotpNeedsHeaders = false
     private var configuredExtendedAddress: UInt8?
+
+    /// Legacy (non-CAN) multi-line OBD reassembly. K-Line/ISO 9141-2/KWP split
+    /// a long mode-09 reply across several `49 PID seq <data>` lines that share
+    /// no length header — unlike ISO-TP, completion is signalled by the
+    /// adapter's prompt, so the controller drains this via `finalizeReassembly`.
+    private struct LegacyFrameKey: Hashable {
+        let header: UInt32?
+        let pid: UInt8
+    }
+
+    private struct LegacyFrameGroup {
+        var frames: [(sequence: UInt8, data: [UInt8])] = []
+    }
+
+    private var legacyFrameStates: [LegacyFrameKey: LegacyFrameGroup] = [:]
+    /// Mode-09 PIDs whose reply is an ASCII/string value segmented across lines.
+    private static let legacyStringPIDs: Set<UInt8> = [0x02, 0x04, 0x06, 0x0A]
 
     private let atCommands: [String: String] = [
         "ATZ": "Reset adapter",
@@ -1802,6 +1829,7 @@ final class OBD2Analyzer {
 
         self.isotpStates.removeAll()
         self.isotpNeedsHeaders = false
+        self.legacyFrameStates.removeAll()
 
         var details: [String] = []
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
@@ -1881,6 +1909,78 @@ final class OBD2Analyzer {
         }
 
         return AnalyzerOutput(headline: "✅ ISO-TP: \(protocolName) Complete Message", details: details)
+    }
+
+    /// Accumulate a legacy multi-line mode-09 segment (`49 PID seq <data>`).
+    /// Returns a per-line progress annotation when the line is recognised as
+    /// part of such a reply, otherwise nil so the generic decoder takes over.
+    private func accumulateLegacyFrame(header: UInt32?, bytes: [UInt8]) -> AnalyzerOutput? {
+        guard bytes.count >= 4, bytes[0] == 0x49 else { return nil }
+        let pid = bytes[1]
+        guard Self.legacyStringPIDs.contains(pid) else { return nil }
+
+        let sequence = bytes[2]
+        let data = Array(bytes.dropFirst(3))
+        let key = LegacyFrameKey(header: header, pid: pid)
+
+        // A sequence of 1 begins a fresh message; drop any stale partial.
+        if sequence <= 0x01 {
+            self.legacyFrameStates[key] = LegacyFrameGroup()
+        }
+        var group = self.legacyFrameStates[key] ?? LegacyFrameGroup()
+        group.frames.append((sequence: sequence, data: data))
+        self.legacyFrameStates[key] = group
+
+        let accumulated = group.frames.reduce(0) { $0 + $1.data.count }
+        let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+        return AnalyzerOutput(
+            headline: "📦 Legacy multi-line (mode 09 PID \(String(format: "%02X", pid)), frame \(sequence))",
+            details: [
+                "Hex: \(hexBytes)",
+                "\(accumulated) bytes across \(group.frames.count) frame(s), waiting for prompt…",
+            ]
+        )
+    }
+
+    /// Drain any pending legacy multi-line replies. Called by the controller
+    /// once the adapter's prompt marks the end of a response.
+    func finalizeReassembly() -> [AnalyzerOutput] {
+        guard !self.legacyFrameStates.isEmpty else { return [] }
+        let pending = self.legacyFrameStates
+        self.legacyFrameStates.removeAll()
+        return pending
+            .sorted { $0.key.pid < $1.key.pid }
+            .map { self.decodeLegacyMessage(pid: $0.key.pid, group: $0.value) }
+    }
+
+    private func decodeLegacyMessage(pid: UInt8, group: LegacyFrameGroup) -> AnalyzerOutput {
+        let payload = group.frames
+            .sorted { $0.sequence < $1.sequence }
+            .flatMap { $0.data }
+        let hexBytes = payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+
+        var details = ["Hex: \(hexBytes)"]
+        let pidHex = String(format: "%02X", pid)
+
+        switch pid {
+            case 0x02:
+                // VIN: strip the leading zero padding, then read as ASCII.
+                let trimmed = Array(payload.drop(while: { $0 == 0x00 }))
+                let vin = String(bytes: trimmed, encoding: .ascii) ?? Self.asciiRepresentation(from: trimmed)
+                details.append("VIN: \(vin)")
+                return AnalyzerOutput(headline: "✅ Mode 09 PID 02: Vehicle Identification Number", details: details)
+
+            case 0x04, 0x0A:
+                // Calibration ID / ECU name: ASCII, NUL bytes separate entries.
+                let text = Self.asciiRepresentation(from: payload.map { $0 == 0x00 ? 0x20 : $0 }).trimmed
+                let label = pid == 0x04 ? "Calibration ID" : "ECU name"
+                details.append("\(label): \(text)")
+                return AnalyzerOutput(headline: "✅ Mode 09 PID \(pidHex): \(label)", details: details)
+
+            default:
+                // CVN (0x06) and anything else: keep as raw hex.
+                return AnalyzerOutput(headline: "✅ Mode 09 PID \(pidHex): reassembled (\(payload.count) bytes)", details: details)
+        }
     }
 
     func annotateIncoming(_ line: String) -> AnalyzerOutput? {
@@ -2044,6 +2144,10 @@ final class OBD2Analyzer {
             }
         }
 
+        if let progress = self.accumulateLegacyFrame(header: parsed.header, bytes: bytes) {
+            return progress
+        }
+
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         let ascii = Self.asciiRepresentation(from: bytes)
 
@@ -2116,6 +2220,7 @@ final class OBD2Analyzer {
             self.configuredExtendedAddress = nil
             self.isotpStates.removeAll()
             self.isotpNeedsHeaders = false
+            self.legacyFrameStates.removeAll()
         }
     }
 
