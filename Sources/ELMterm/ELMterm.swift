@@ -606,6 +606,11 @@ final class TerminalController: NSObject {
                 continue
             }
 
+            if char == 9 { // Tab – complete meta commands
+                self.completeMetaCommand(buffer: &buffer, cursorPos: &cursorPos, prompt: prompt)
+                continue
+            }
+
             // Regular character
             if char >= 32 && char < 127 {
                 let charStr = String(UnicodeScalar(char))
@@ -621,6 +626,40 @@ final class TerminalController: NSObject {
                 }
             }
         }
+    }
+
+    /// Tab completion for meta commands. Only the leading `:` keyword is
+    /// completed (we have no argument vocabulary): a single match is filled in
+    /// with a trailing space, several matches extend the shared prefix, and an
+    /// ambiguous prefix prints the candidates.
+    private func completeMetaCommand(buffer: inout String, cursorPos: inout Int, prompt: String) {
+        guard cursorPos == buffer.count, buffer.hasPrefix(":"), !buffer.contains(" ") else { return }
+
+        let matches = MetaCommand.completions(for: buffer)
+        guard !matches.isEmpty else { return }
+
+        if matches.count == 1 {
+            self.replaceLineBuffer(&buffer, &cursorPos, with: matches[0] + " ", prompt: prompt)
+            return
+        }
+
+        let shared = Self.longestCommonPrefix(of: matches)
+        if shared.count > buffer.count {
+            self.replaceLineBuffer(&buffer, &cursorPos, with: shared, prompt: prompt)
+        } else {
+            self.emitLine(matches.joined(separator: "   "))
+        }
+    }
+
+    private static func longestCommonPrefix(of strings: [String]) -> String {
+        guard var prefix = strings.first else { return "" }
+        for string in strings.dropFirst() {
+            while !string.hasPrefix(prefix) {
+                prefix.removeLast()
+                if prefix.isEmpty { return "" }
+            }
+        }
+        return prefix
     }
 
     private func readChar(timeout: TimeInterval) throws -> UInt8? {
@@ -2500,6 +2539,7 @@ final class TerminalUI {
     private func hintSegments() -> [String] {
         [
             "\(self.cyan):help\(self.reset)",
+            "\(self.cyan)⇥\(self.reset)\(self.dim) complete\(self.reset)",
             "\(self.cyan)↑↓\(self.reset)\(self.dim) history\(self.reset)",
             "\(self.cyan)Ctrl-C\(self.reset)\(self.dim) exit\(self.reset)",
         ]
