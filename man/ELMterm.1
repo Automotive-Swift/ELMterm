@@ -17,6 +17,7 @@
 .Op Fl -hexdump
 .Op Fl -plain
 .Op Fl -timestamps
+.Op Fl -no-tui
 .Op Fl -log Ar path
 .Sh DESCRIPTION
 .Nm
@@ -61,6 +62,8 @@ Print incoming frames as ASCII plus hexadecimal dump.
 Disable analyzer and annotation pipeline.
 .It Fl -timestamps
 Prefix RX and TX lines with ISO8601 timestamps.
+.It Fl -no-tui
+Use a scrolling line-by-line REPL instead of the bottom-anchored TUI.
 .It Fl -log Ar path
 Write communication log output to file.
 .It Fl h , Fl -help
@@ -77,6 +80,20 @@ Show the most recent history entries.
 Clear terminal output.
 .It Ic :analyzer Op Ic on|off
 Toggle protocol analyzer annotations.
+.It Ic :log Op Ar path | Ic off
+Start or stop logging communication to a file, or show the current status.
+.It Ic :every Ar interval Ar command
+Send
+.Ar command
+repeatedly every
+.Ar interval
+(for example
+.Dq 2s ,
+.Dq 500ms ,
+.Dq 1m ) .
+With no arguments, list active periodic tasks; with
+.Ic off Op Ar id
+stop one task by id or all of them.
 .It Ic :save
 Persist in-memory history immediately.
 .It Ic :quit

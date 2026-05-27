@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-SwiftPM drives the layout: `Package.swift` defines the executable target plus `CornucopiaStreams` and `swift-argument-parser`. Runtime code currently lives in `Sources/ELMterm/ELMterm.swift` (CLI, REPL, analyzer). Build products land under `.build/`; keep it untracked. Add modules by extending `Package.swift` and mirroring folders under `Sources/` or `Tests/` so protocol decoders, transports, and UI helpers stay isolated.
+SwiftPM drives the layout: `Package.swift` defines the executable target plus `CornucopiaStreams` and `swift-argument-parser`. Runtime code lives in `Sources/ELMterm/` — `ELMterm.swift` (CLI, REPL, bottom-anchored TUI, half-duplex command pump, OBD/UDS analyzer) and `PeriodicScheduler.swift` (timer-driven `:every` commands) — with a small C shim in `Sources/CELMtermShim/` for `TIOCGWINSZ`. Build products land under `.build/`; keep it untracked. Add modules by extending `Package.swift` and mirroring folders under `Sources/` or `Tests/` so protocol decoders, transports, and UI helpers stay isolated.
 
 ## Build, Test, and Development Commands
 - `swift build` — debug build; binary at `.build/debug/ELMterm`.

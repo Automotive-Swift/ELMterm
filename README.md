@@ -59,6 +59,7 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
 - **Real-time Protocol Annotation**: Every request and response is automatically analyzed and annotated with semantic meaning
 - **OBD-II vs UDS/KWP Detection**: Automatically distinguishes between OBD-II (modes 01-0F) and UDS/KWP (modes 10+) protocols
 - **ISO-TP Reassembly**: Automatically detects and reassembles multi-frame ISO 15765-2 messages with sequence validation
+- **Legacy Multi-Line Reassembly**: Reassembles segmented mode-09 replies on non-CAN links (K-Line/ISO 9141-2, KWP) where each `49 PID seq …` line carries a slice and the adapter prompt marks completion
 - **NRC Decoding**: Comprehensive Negative Response Code (ISO 14229-1:2020) descriptions with 50+ error codes
 - **VIN Extraction**: Automatically decodes Vehicle Identification Numbers from mode 09 PID 02 responses
 - **CAN Header Handling**: Intelligently strips variable-length CAN headers (11-bit and 29-bit)
@@ -68,6 +69,9 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
 
 - **Readline-Style Editing**: Full cursor movement, character insertion/deletion
 - **Command History**: Navigate previous commands with arrow keys (↑/↓)
+- **Tab Completion**: Complete `:` meta commands with the Tab key
+- **Periodic Commands**: Repeatedly send a command at a fixed cadence with `:every` (e.g. poll `0902` every 2s)
+- **Half-Duplex Command Pump**: One command in flight at a time; the next queued command is released only once the adapter's prompt confirms the previous response is complete, so periodic and interactive traffic never collide
 - **Proper CR/LF Handling**: Clean display without text concatenation or stray characters
 - **ELM327/STN Command Recognition**: Built-in hints and descriptions for AT/ST commands
 - **Color-Coded Output**: Distinguishes incoming, outgoing, and status messages with readable colors
@@ -96,6 +100,24 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
   - First frame + consecutive frames
   - Automatic sequence validation
   - Message reassembly
+
+- **Legacy multi-line** (non-CAN: ISO 9141-2, ISO 14230 KWP / K-Line)
+  - Reassembles segmented mode-09 string replies (VIN, calibration IDs, ECU name)
+  - Each `49 PID seq <data>` line is collected and ordered by its sequence byte
+  - Completion is driven by the adapter prompt (these replies carry no length header)
+
+A K-Line VIN, returned line-by-line, is reassembled on the prompt:
+
+```
+> 0902
+49 02 01 00 00 00 57
+→ 📦 Legacy multi-line (mode 09 PID 02, frame 1)
+49 02 02 44 58 2D 53
+→ 📦 Legacy multi-line (mode 09 PID 02, frame 2)
+   … frames 3–5 …
+→ ✅ Mode 09 PID 02: Vehicle Identification Number
+    VIN: WDX-SIM0019212345
+```
 
 ## Installation
 
@@ -153,6 +175,8 @@ OPTIONS:
   --hexdump               Print incoming frames as ASCII + hexdump
   --plain                 Disable analyzer/annotation pipeline
   --timestamps            Prefix RX/TX lines with ISO8601 timestamps
+  --no-tui                Use a scrolling line-by-line REPL instead of the bottom-anchored TUI
+  --log <path>            Write the communication log to the given file
   -h, --help              Show full help information
 ```
 
@@ -184,8 +208,39 @@ ELMterm supports meta commands prefixed with `:`:
 - `:history [n]` - Show the last `n` commands (default 20)
 - `:clear` - Clear the terminal
 - `:analyzer [on|off]` - Toggle protocol annotations or force a state
+- `:log [path|off]` - Start/stop logging communication to a file, or show status
+- `:every <interval> <command>` - Send `<command>` repeatedly at a fixed cadence
+- `:every` - List active periodic tasks
+- `:every off [id]` - Stop one periodic task (by id) or all of them
 - `:save` - Persist in-memory history immediately
 - `:quit` (or `:exit`) - Leave the terminal
+
+Press <kbd>Tab</kbd> to complete a partially typed meta command.
+
+#### Periodic Commands
+
+`:every` schedules a command to be re-sent on a timer—handy for polling a PID or
+keeping a tester-present alive:
+
+```
+> :every 2s 0902
+Periodic task #1: sending '0902' every 2s.
+> :every 5s 3E00
+Periodic task #2: sending '3E00' every 5s.
+> :every
+[1] every 2s  →  0902
+[2] every 5s  →  3E00
+> :every off 1
+Stopped periodic task #1.
+> :every off
+Stopped all periodic tasks.
+```
+
+Intervals accept `ms`, `s`, `m`, or a bare number (seconds). Multiple tasks run
+concurrently; all transmissions are serialized through the half-duplex command
+pump, so each response is fully received before the next command is sent.
+Periodic ticks also yield briefly to interactive input, so typing a command by
+hand is never disrupted.
 
 ### Example Session
 
@@ -295,9 +350,13 @@ If you see garbled output, ensure:
 ```
 ELMterm/
 ├── Sources/
-│   └── ELMterm/
-│       └── ELMterm.swift      # Main application
-├── Package.swift              # Swift package manifest
+│   ├── ELMterm/
+│   │   ├── ELMterm.swift          # CLI, REPL, TUI, analyzer
+│   │   └── PeriodicScheduler.swift # Timer-driven periodic commands
+│   └── CELMtermShim/              # C shim (TIOCGWINSZ via ioctl)
+├── Tests/
+│   └── ELMtermTests/              # Analyzer unit tests
+├── Package.swift                  # Swift package manifest
 ├── README.md
 └── LICENSE
 ```
