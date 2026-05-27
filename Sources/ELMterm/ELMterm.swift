@@ -50,6 +50,12 @@ struct ELMterm: AsyncParsableCommand {
     @Option(name: .long, help: "Write communication log to the specified file.")
     var log: String?
 
+    @Option(name: .customLong("init"), help: "Send commands from this file right after connecting (one per line, # for comments).")
+    var initFile: String?
+
+    @Option(name: .long, help: "Send a command, then exit once its response arrives. Repeatable; implies non-interactive mode.")
+    var exec: [String] = []
+
     mutating func run() async throws {
 
         guard let endpoint = URL(string: self.urlString) else {
@@ -60,13 +66,18 @@ struct ELMterm: AsyncParsableCommand {
 
         let preferences = self.loadPreferences()
         let effectiveTheme = self.theme ?? preferences.theme ?? .light
-        let palette = ColorPalette.palette(for: effectiveTheme)
+        // Colour only when stdout is a real terminal, so piped or redirected
+        // output stays clean text.
+        let palette = isatty(STDOUT_FILENO) != 0 ? ColorPalette.palette(for: effectiveTheme) : .plain
         let historyURL = Self.makeHistoryURL(from: self.history ?? preferences.historyPath)
         let historyDepth = preferences.historyDepth ?? self.historyDepth
 
         let logFileURL: URL? = self.log.map { path in
             URL(fileURLWithPath: Self.expandPath(path)).standardizedFileURL
         }
+
+        let initCommands = try self.initFile.map { try Self.loadCommandFile($0) } ?? []
+        let isOneShot = !self.exec.isEmpty
 
         let configuration = TerminalConfiguration(
             prompt: self.prompt,
@@ -78,7 +89,8 @@ struct ELMterm: AsyncParsableCommand {
             annotationIndent: 2,
             colorPalette: palette,
             logFileURL: logFileURL,
-            useTUI: !self.noTui
+            useTUI: !self.noTui && !isOneShot,
+            initCommands: initCommands
         )
 
         let controller = TerminalController(configuration: configuration, analyzer: self.plain ? nil : OBD2Analyzer())
@@ -88,10 +100,15 @@ struct ELMterm: AsyncParsableCommand {
         }
         signalHandler.activate()
         let connectTimeout = self.timeout
+        let execCommands = self.exec
 
         let replTask = Task.detached(priority: .userInitiated) {
             do {
-                try await controller.start(url: endpoint, timeout: connectTimeout)
+                if isOneShot {
+                    try await controller.runBatch(url: endpoint, timeout: connectTimeout, commands: execCommands)
+                } else {
+                    try await controller.start(url: endpoint, timeout: connectTimeout)
+                }
             } catch {
                 controller.report(error: error)
                 throw error
@@ -107,6 +124,22 @@ struct ELMterm: AsyncParsableCommand {
             case .failure(let error):
                 throw error
         }
+    }
+
+    /// Read a command file: one command per line, blank lines and `#` comments
+    /// ignored. Used by `--init`.
+    private static func loadCommandFile(_ path: String) throws -> [String] {
+        let expanded = Self.expandPath(path)
+        let content: String
+        do {
+            content = try String(contentsOfFile: expanded, encoding: .utf8)
+        } catch {
+            throw ValidationError("Unable to read command file \(expanded): \(error.localizedDescription)")
+        }
+        return content
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 
     private func loadPreferences() -> UserPreferences {

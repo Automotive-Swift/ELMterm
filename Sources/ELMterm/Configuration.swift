@@ -24,6 +24,23 @@ struct ColorPalette {
 
     static let reset = "\u{001B}[0m"
 
+    /// Reset sequence matched to this palette: empty for the colourless
+    /// `plain` palette so non-TTY output carries no stray escape codes,
+    /// the real CSI reset otherwise.
+    var reset: String { self.outgoing.isEmpty ? "" : ColorPalette.reset }
+
+    /// Escape-free palette used when stdout is not a TTY, so piped or
+    /// redirected output stays clean text instead of carrying ANSI codes.
+    static let plain = ColorPalette(
+        outgoing: "",
+        incoming: "",
+        status: "",
+        annotationOutgoing: "",
+        annotationIncoming: "",
+        hexdump: "",
+        error: ""
+    )
+
     static func palette(for theme: ColorTheme) -> ColorPalette {
         switch theme {
             case .light:
@@ -70,6 +87,8 @@ struct TerminalConfiguration {
     let colorPalette: ColorPalette
     let logFileURL: URL?
     let useTUI: Bool
+    /// Commands sent automatically right after connecting (from `--init`).
+    let initCommands: [String]
 }
 
 /// Supported command terminators for the REPL.

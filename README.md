@@ -177,7 +177,40 @@ OPTIONS:
   --timestamps            Prefix RX/TX lines with ISO8601 timestamps
   --no-tui                Use a scrolling line-by-line REPL instead of the bottom-anchored TUI
   --log <path>            Write the communication log to the given file
+  --init <path>           Send commands from this file right after connecting (one per line, # comments)
+  --exec <command>        Send a command, then exit once its response arrives; repeatable, non-interactive
   -h, --help              Show full help information
+```
+
+ANSI colors are emitted only when stdout is a terminal, so piping or
+redirecting ELMterm produces clean plain-text output (annotations are kept;
+use `--plain` to drop them too).
+
+### Startup Scripts & One-Shot Mode
+
+`--init` replays a command file every time you connect—handy for the adapter
+setup you always run:
+
+```bash
+$ cat ~/elm-setup.txt
+# reset and configure the adapter
+ATZ
+ATE0
+ATSP6
+
+$ ELMterm tcp://192.168.0.10:35000 --init ~/elm-setup.txt
+```
+
+`--exec` sends one or more commands and exits as soon as their responses are in,
+which makes ELMterm scriptable. It runs after any `--init` commands, disables
+the TUI, and (when piped) emits plain text:
+
+```bash
+# Read a VIN and quit
+$ ELMterm tcp://192.168.0.10:35000 --init ~/elm-setup.txt --exec 0902
+
+# Chain several requests
+$ ELMterm tcp://192.168.0.10:35000 --exec 0100 --exec 0902 --exec 010C
 ```
 
 ### Configuration & Theming

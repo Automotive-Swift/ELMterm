@@ -51,6 +51,9 @@ final class TerminalController: NSObject {
     private var inFlightCommand: String?
     private var commandWatchdog: DispatchSourceTimer?
     private let commandWatchdogQueue = DispatchQueue(label: "ELMterm.command.watchdog")
+    /// Resumed once the command queue fully drains; lets one-shot batch mode
+    /// wait for every command's response before exiting. Guarded by commandLock.
+    private var drainContinuation: CheckedContinuation<Void, Never>?
 
     private var pendingShutdown = false
     private var streamsScheduledOnRunLoop = false
@@ -149,6 +152,8 @@ final class TerminalController: NSObject {
         self.configureStreams()
         self.printStatus("Connected – stream open, type :help for assistance.")
 
+        self.enqueueInitCommands()
+
         do {
             try await self.replLoop()
         } catch {
@@ -158,6 +163,45 @@ final class TerminalController: NSObject {
 
         self.cleanupStreams()
         self.printStatus("Disconnected.")
+    }
+
+    /// Connect, run the init commands followed by `commands`, wait for every
+    /// response, and return — the non-interactive (`--exec`) batch path.
+    func runBatch(url: URL, timeout: TimeInterval, commands: [String]) async throws {
+
+        let (input, output) = try await Cornucopia.Streams.connect(url: url, timeout: timeout)
+        self.inputStream = input
+        self.outputStream = output
+        self.configureStreams()
+
+        let batch = self.configuration.initCommands + commands
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.commandLock.lock()
+            self.drainContinuation = continuation
+            // Queue the whole batch atomically before pumping so a fast
+            // prompt can't drain the queue between enqueues and resume early.
+            for command in batch {
+                self.commandQueue.append((command: command, interactive: true))
+            }
+            self.commandLock.unlock()
+            self.pumpNextCommand()
+        }
+
+        // Output is emitted asynchronously; drain the queue so the last
+        // response's lines reach stdout before the process exits.
+        self.outputQueue.sync { fflush(stdout) }
+        self.cleanupStreams()
+    }
+
+    private func enqueueInitCommands() {
+        let initCommands = self.configuration.initCommands
+        guard !initCommands.isEmpty else { return }
+        self.commandLock.lock()
+        for command in initCommands {
+            self.commandQueue.append((command: command, interactive: true))
+        }
+        self.commandLock.unlock()
+        self.pumpNextCommand()
     }
 
     private func activateTUIIfPossible() {
@@ -211,7 +255,7 @@ final class TerminalController: NSObject {
 
     func report(error: Error) {
         let color = self.colorPalette.error
-        self.emitLine("\(color)Error: \(error.localizedDescription)\(ColorPalette.reset)")
+        self.emitLine("\(color)Error: \(error.localizedDescription)\(self.colorPalette.reset)")
     }
 
     private func readUserInput() throws -> String {
@@ -607,7 +651,7 @@ final class TerminalController: NSObject {
 
         guard let command = MetaCommand(metaCommand) else {
             let color = self.colorPalette.error
-            self.emitLine("\(color)Unknown command: \(metaCommand)\(ColorPalette.reset)")
+            self.emitLine("\(color)Unknown command: \(metaCommand)\(self.colorPalette.reset)")
             return
         }
 
@@ -728,13 +772,25 @@ final class TerminalController: NSObject {
 
     private func pumpNextCommand() {
         self.commandLock.lock()
-        guard self.inFlightCommand == nil, !self.commandQueue.isEmpty else {
+        // Nothing in flight and nothing queued: the queue has drained — release
+        // any batch waiter before returning.
+        if self.inFlightCommand == nil, self.commandQueue.isEmpty {
+            let continuation = self.drainContinuation
+            self.drainContinuation = nil
+            self.commandLock.unlock()
+            continuation?.resume()
+            return
+        }
+        guard self.inFlightCommand == nil else {
             self.commandLock.unlock()
             return
         }
         guard !self.pendingShutdown, self.outputStream?.streamStatus == .open else {
             self.commandQueue.removeAll()
+            let continuation = self.drainContinuation
+            self.drainContinuation = nil
             self.commandLock.unlock()
+            continuation?.resume()
             return
         }
         let next = self.commandQueue.removeFirst()
@@ -762,7 +818,11 @@ final class TerminalController: NSObject {
         self.commandQueue.removeAll()
         self.inFlightCommand = nil
         self.cancelCommandWatchdogLocked()
+        // Unblock a batch waiter so an interrupt or disconnect doesn't hang.
+        let continuation = self.drainContinuation
+        self.drainContinuation = nil
         self.commandLock.unlock()
+        continuation?.resume()
     }
 
     /// Drop queued periodic commands so a stopped task can't fire once more.
@@ -845,7 +905,7 @@ final class TerminalController: NSObject {
         components.append(body)
         let line = components.isEmpty ? body : components.joined(separator: " ")
         let color = self.color(for: direction)
-        self.emitLine("\(color)\(line)\(ColorPalette.reset)")
+        self.emitLine("\(color)\(line)\(self.colorPalette.reset)")
     }
 
     private func printAnnotation(_ annotation: AnalyzerOutput, direction: AdapterMessage.Direction) {
@@ -853,9 +913,9 @@ final class TerminalController: NSObject {
         guard self.annotationEnabled else { return }
         let indent = String(repeating: " ", count: self.configuration.annotationIndent)
         let color = self.annotationColor(for: direction)
-        var lines = ["\(color)→ \(annotation.headline)\(ColorPalette.reset)"]
+        var lines = ["\(color)→ \(annotation.headline)\(self.colorPalette.reset)"]
         for line in annotation.details {
-            lines.append("\(color)\(indent)  \(line)\(ColorPalette.reset)")
+            lines.append("\(color)\(indent)  \(line)\(self.colorPalette.reset)")
         }
         self.emitLines(lines)
     }
@@ -945,7 +1005,7 @@ final class TerminalController: NSObject {
     }
 
     private func emitError(_ message: String) {
-        self.emitLine("\(self.colorPalette.error)\(message)\(ColorPalette.reset)")
+        self.emitLine("\(self.colorPalette.error)\(message)\(self.colorPalette.reset)")
     }
 
     private func flushPendingWritesSafely() {
@@ -1066,7 +1126,7 @@ final class TerminalController: NSObject {
             if self.configuration.hexdump {
                 let color = self.colorPalette.hexdump
                 let hexLines = data.hexdump().split(separator: "\n").map {
-                    "\(color)\($0)\(ColorPalette.reset)"
+                    "\(color)\($0)\(self.colorPalette.reset)"
                 }
                 self.emitLines(hexLines)
             }
@@ -1100,14 +1160,14 @@ final class TerminalController: NSObject {
                     (0x20...0x7E).contains(Int(byte)) ? String(UnicodeScalar(byte)) : "."
                 }.joined()
                 let color = self.colorPalette.hexdump
-                self.emitLine("\(color)    ASCII: \(ascii)\(ColorPalette.reset)")
+                self.emitLine("\(color)    ASCII: \(ascii)\(self.colorPalette.reset)")
             }
         }
 
         if self.configuration.hexdump, let asciiData = trimmed.data(using: .utf8) {
             let color = self.colorPalette.hexdump
             let hexLines = asciiData.hexdump().split(separator: "\n").map {
-                "\(color)\($0)\(ColorPalette.reset)"
+                "\(color)\($0)\(self.colorPalette.reset)"
             }
             self.emitLines(hexLines)
         }

@@ -19,6 +19,8 @@
 .Op Fl -timestamps
 .Op Fl -no-tui
 .Op Fl -log Ar path
+.Op Fl -init Ar path
+.Op Fl -exec Ar command
 .Sh DESCRIPTION
 .Nm
 connects to serial or TCP ELM-compatible interfaces and provides an interactive
@@ -66,6 +68,21 @@ Prefix RX and TX lines with ISO8601 timestamps.
 Use a scrolling line-by-line REPL instead of the bottom-anchored TUI.
 .It Fl -log Ar path
 Write communication log output to file.
+.It Fl -init Ar path
+Send commands read from
+.Ar path
+immediately after connecting, one command per line; blank lines and lines
+beginning with
+.Ql #
+are ignored.
+.It Fl -exec Ar command
+Send
+.Ar command
+and exit once its response arrives. May be given multiple times to run a
+sequence of commands; runs after any
+.Fl -init
+commands and disables the interactive TUI. ANSI colors are emitted only when
+standard output is a terminal.
 .It Fl h , Fl -help
 Show help output.
 .El
@@ -110,6 +127,8 @@ Optional JSON configuration file.
 .Bd -literal -offset indent
 ELMterm tty:///dev/cu.usbserial-113010893810
 ELMterm tcp://192.168.0.10:35000 --timestamps
+ELMterm tcp://192.168.0.10:35000 --init ~/elm-setup.txt
+ELMterm tcp://192.168.0.10:35000 --exec 0100 --exec 0902
 .Ed
 .Sh EXIT STATUS
 .Ex -std
