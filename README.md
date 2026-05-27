@@ -61,6 +61,8 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
 - **ISO-TP Reassembly**: Automatically detects and reassembles multi-frame ISO 15765-2 messages with sequence validation
 - **Legacy Multi-Line Reassembly**: Reassembles segmented mode-09 replies on non-CAN links (K-Line/ISO 9141-2, KWP) where each `49 PID seq …` line carries a slice and the adapter prompt marks completion
 - **NRC Decoding**: Comprehensive Negative Response Code (ISO 14229-1:2020) descriptions with 50+ error codes
+- **DTC Decoding**: Decodes stored/pending/permanent trouble codes (modes 03/07/0A) into P/C/B/U codes, plus UDS ReadDTCInformation (0x19) records with their status flags, and annotates well-known generic codes with descriptions
+- **Live Data PIDs**: Decodes ~30 common mode-01 PIDs (RPM, speed, temperatures, fuel trims, MAF, loads, pressures, voltages, λ, …) into engineering units
 - **VIN Extraction**: Automatically decodes Vehicle Identification Numbers from mode 09 PID 02 responses
 - **CAN Header Handling**: Intelligently strips variable-length CAN headers (11-bit and 29-bit)
 - **ASCII Representation**: Shows readable ASCII for long hex responses
@@ -83,12 +85,15 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
   - Mode 02: Show freeze frame data
   - Mode 03: Show stored DTCs
   - Mode 04: Clear DTCs
+  - Mode 03 / 07 / 0A: Stored / pending / permanent DTCs (decoded to P/C/B/U codes)
   - Mode 09: Request vehicle information (VIN, calibration IDs, etc.)
+  - ~30 common mode-01 live-data PIDs decoded into engineering units
   - And more...
 
 - **UDS** (ISO 14229)
   - Diagnostic session control (0x10)
   - ECU reset (0x11)
+  - Read DTC information (0x19) with per-DTC status flags
   - Read data by identifier (0x22)
   - Security access (0x27)
   - Communication control (0x28)
@@ -322,6 +327,17 @@ ELM327 v1.4b
     Hex: 7F 10 12
     ASCII: ...
 
+> 03
+03
+→ OBD-II request (mode 03)
+    Hex: 03
+    Show stored diagnostic trouble codes
+7E8 43 01 33 01 71
+→ ✅ Mode 03: 2 stored DTCs
+    Hex: 43 01 33 01 71
+    P0133 — O2 Sensor Circuit Slow Response (Bank 1, Sensor 1)
+    P0171 — System Too Lean (Bank 1)
+
 > :quit
 ```
 
@@ -387,6 +403,7 @@ ELMterm/
 │   │   ├── ELMterm.swift            # @main CLI entry point (ArgumentParser)
 │   │   ├── TerminalController.swift # REPL, line editor, command pump, streams
 │   │   ├── OBD2Analyzer.swift       # OBD-II/UDS/KWP annotation + reassembly
+│   │   ├── DTCDecoder.swift         # Trouble-code decoding + descriptions
 │   │   ├── TerminalUI.swift         # Bottom-anchored TUI
 │   │   ├── PeriodicScheduler.swift  # Timer-driven periodic commands
 │   │   ├── MetaCommand.swift        # `:` meta command parsing

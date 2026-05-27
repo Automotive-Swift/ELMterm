@@ -97,10 +97,19 @@ final class OBD2Analyzer {
     }
 
     private let pidDatabase: [UInt8: PIDInfo] = [
-        0x05: .init(description: "Engine coolant temperature", formatter: { bytes in
+        0x04: .init(description: "Calculated engine load", formatter: OBD2Analyzer.percent255),
+        0x05: .init(description: "Engine coolant temperature", formatter: OBD2Analyzer.tempMinus40),
+        0x06: .init(description: "Short term fuel trim (Bank 1)", formatter: OBD2Analyzer.fuelTrim),
+        0x07: .init(description: "Long term fuel trim (Bank 1)", formatter: OBD2Analyzer.fuelTrim),
+        0x08: .init(description: "Short term fuel trim (Bank 2)", formatter: OBD2Analyzer.fuelTrim),
+        0x09: .init(description: "Long term fuel trim (Bank 2)", formatter: OBD2Analyzer.fuelTrim),
+        0x0A: .init(description: "Fuel pressure", formatter: { bytes in
             guard let a = bytes.first else { return nil }
-            let value = Int(a) - 40
-            return "\(value) °C"
+            return "\(Int(a) * 3) kPa"
+        }),
+        0x0B: .init(description: "Intake manifold absolute pressure", formatter: { bytes in
+            guard let a = bytes.first else { return nil }
+            return "\(a) kPa"
         }),
         0x0C: .init(description: "Engine RPM", formatter: { bytes in
             guard bytes.count >= 2 else { return nil }
@@ -111,21 +120,78 @@ final class OBD2Analyzer {
             guard let a = bytes.first else { return nil }
             return "\(a) km/h"
         }),
-        0x0F: .init(description: "Intake air temperature", formatter: { bytes in
+        0x0E: .init(description: "Timing advance", formatter: { bytes in
             guard let a = bytes.first else { return nil }
-            return "\(Int(a) - 40) °C"
+            return String(format: "%.1f° before TDC", Double(a) / 2.0 - 64.0)
         }),
-        0x11: .init(description: "Throttle position", formatter: { bytes in
-            guard let a = bytes.first else { return nil }
-            let percent = Double(a) * 100.0 / 255.0
-            return String(format: "%.1f %%", percent)
+        0x0F: .init(description: "Intake air temperature", formatter: OBD2Analyzer.tempMinus40),
+        0x10: .init(description: "MAF air flow rate", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) / 100.0
+            return String(format: "%.2f g/s", value)
         }),
-        0x2F: .init(description: "Fuel level", formatter: { bytes in
+        0x11: .init(description: "Throttle position", formatter: OBD2Analyzer.percent255),
+        0x1F: .init(description: "Run time since engine start", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            return "\(Int(bytes[0]) << 8 | Int(bytes[1])) s"
+        }),
+        0x21: .init(description: "Distance with MIL on", formatter: OBD2Analyzer.distanceKm),
+        0x23: .init(description: "Fuel rail gauge pressure", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            return "\((Int(bytes[0]) << 8 | Int(bytes[1])) * 10) kPa"
+        }),
+        0x2C: .init(description: "Commanded EGR", formatter: OBD2Analyzer.percent255),
+        0x2D: .init(description: "EGR error", formatter: OBD2Analyzer.fuelTrim),
+        0x2F: .init(description: "Fuel level", formatter: OBD2Analyzer.percent255),
+        0x31: .init(description: "Distance since codes cleared", formatter: OBD2Analyzer.distanceKm),
+        0x33: .init(description: "Absolute barometric pressure", formatter: { bytes in
             guard let a = bytes.first else { return nil }
-            let percent = Double(a) * 100.0 / 255.0
-            return String(format: "%.1f %%", percent)
+            return "\(a) kPa"
+        }),
+        0x42: .init(description: "Control module voltage", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) / 1000.0
+            return String(format: "%.3f V", value)
+        }),
+        0x43: .init(description: "Absolute load value", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) * 100.0 / 255.0
+            return String(format: "%.1f %%", value)
+        }),
+        0x44: .init(description: "Commanded equivalence ratio (λ)", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) / 32768.0
+            return String(format: "%.3f", value)
+        }),
+        0x45: .init(description: "Relative throttle position", formatter: OBD2Analyzer.percent255),
+        0x46: .init(description: "Ambient air temperature", formatter: OBD2Analyzer.tempMinus40),
+        0x49: .init(description: "Accelerator pedal position D", formatter: OBD2Analyzer.percent255),
+        0x4A: .init(description: "Accelerator pedal position E", formatter: OBD2Analyzer.percent255),
+        0x5C: .init(description: "Engine oil temperature", formatter: OBD2Analyzer.tempMinus40),
+        0x5E: .init(description: "Engine fuel rate", formatter: { bytes in
+            guard bytes.count >= 2 else { return nil }
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) / 20.0
+            return String(format: "%.2f L/h", value)
         }),
     ]
+
+    /// Shared PID formatters for the common encodings (SAE J1979).
+    private static func percent255(_ bytes: [UInt8]) -> String? {
+        guard let a = bytes.first else { return nil }
+        return String(format: "%.1f %%", Double(a) * 100.0 / 255.0)
+    }
+    private static func tempMinus40(_ bytes: [UInt8]) -> String? {
+        guard let a = bytes.first else { return nil }
+        return "\(Int(a) - 40) °C"
+    }
+    private static func fuelTrim(_ bytes: [UInt8]) -> String? {
+        guard let a = bytes.first else { return nil }
+        return String(format: "%.1f %%", Double(a) * 100.0 / 128.0 - 100.0)
+    }
+    private static func distanceKm(_ bytes: [UInt8]) -> String? {
+        guard bytes.count >= 2 else { return nil }
+        return "\(Int(bytes[0]) << 8 | Int(bytes[1])) km"
+    }
 
     private let obd2ModeDescriptions: [UInt8: String] = [
         0x01: "Show current data",
@@ -339,6 +405,76 @@ final class OBD2Analyzer {
         return AnalyzerOutput(headline: "\(protocolName) request (mode \(String(format: "%02X", mode)))", details: details)
     }
 
+    /// True for an OBD-II DTC report response (mode 03/07/0A).
+    private static let obd2DTCModes: Set<UInt8> = [0x03, 0x07, 0x0A]
+
+    /// Decode an OBD-II mode 03/07/0A response into a headline + DTC lines.
+    /// `payload` is everything after the response mode byte (0x43/0x47/0x4A).
+    private func obd2DTCDetails(mode: UInt8, payload: [UInt8]) -> (headline: String, lines: [String]) {
+        var bytes = payload
+        // Some CAN ECUs prefix a DTC count byte, leaving an odd byte count.
+        if !bytes.count.isMultiple(of: 2) { bytes = Array(bytes.dropFirst()) }
+        var codes: [String] = []
+        var index = 0
+        while index + 1 < bytes.count {
+            let high = bytes[index]
+            let low = bytes[index + 1]
+            index += 2
+            if high == 0, low == 0 { continue }   // padding / empty slot
+            codes.append(DTCDecoder.code(high, low))
+        }
+
+        let label: String
+        switch mode {
+            case 0x03: label = "stored"
+            case 0x07: label = "pending"
+            case 0x0A: label = "permanent"
+            default: label = "reported"
+        }
+        let modeHex = String(format: "%02X", mode)
+        guard !codes.isEmpty else {
+            return ("✅ Mode \(modeHex): no \(label) DTCs", [])
+        }
+        let lines = codes.map { DTCDecoder.describe($0) }
+        return ("✅ Mode \(modeHex): \(codes.count) \(label) DTC\(codes.count == 1 ? "" : "s")", lines)
+    }
+
+    /// Decode a UDS ReadDTCInformation (0x59) response into detail lines, or an
+    /// empty array when the subfunction isn't one we render DTC records for.
+    private func udsReadDTCDetails(bytes: [UInt8]) -> [String] {
+        guard bytes.count >= 2 else { return [] }
+        let subFunction = bytes[1] & 0x7F
+
+        switch subFunction {
+            case 0x01:   // report number of DTC by status mask
+                guard bytes.count >= 6 else { return [] }
+                let count = Int(bytes[4]) << 8 | Int(bytes[5])
+                return ["\(count) matching DTC(s)"]
+
+            case 0x02, 0x0A, 0x13, 0x15:   // status-mask / supported: 4-byte records
+                var records = Array(bytes.dropFirst(3))   // skip 59, subfn, statusAvailabilityMask
+                var lines: [String] = []
+                while records.count >= 4 {
+                    let baseCode = DTCDecoder.code(records[0], records[1])
+                    let fullCode = DTCDecoder.code(records[0], records[1], records[2])
+                    let flags = DTCDecoder.statusFlags(records[3])
+                    records.removeFirst(4)
+                    var line = fullCode
+                    if let description = DTCDecoder.description(for: baseCode) {
+                        line += " — \(description)"
+                    }
+                    if !flags.isEmpty {
+                        line += "  [\(flags.joined(separator: ", "))]"
+                    }
+                    lines.append(line)
+                }
+                return lines
+
+            default:
+                return []
+        }
+    }
+
     private func decodeCompleteISOTPMessage(_ bytes: [UInt8]) -> AnalyzerOutput {
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         let ascii = Self.asciiRepresentation(from: bytes)
@@ -365,6 +501,24 @@ final class OBD2Analyzer {
         let isOBD2 = mode <= 0x0F
         let protocolName = isOBD2 ? "OBD-II" : "UDS/KWP"
         let modeDescriptions = isOBD2 ? self.obd2ModeDescriptions : self.udsModeDescriptions
+
+        if isOBD2, Self.obd2DTCModes.contains(mode) {
+            let (headline, dtcLines) = self.obd2DTCDetails(mode: mode, payload: Array(bytes.dropFirst()))
+            details.append(contentsOf: dtcLines)
+            return AnalyzerOutput(headline: headline, details: details)
+        }
+
+        if !isOBD2, mode == 0x19 {
+            let dtcLines = self.udsReadDTCDetails(bytes: bytes)
+            if !dtcLines.isEmpty {
+                if let description = modeDescriptions[mode] {
+                    let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+                    details.append((["Mode 19: \(description)"] + subParts).joined(separator: " · "))
+                }
+                details.append(contentsOf: dtcLines)
+                return AnalyzerOutput(headline: "✅ ISO-TP: UDS Read DTC information", details: details)
+            }
+        }
 
         if let description = modeDescriptions[mode] {
             let modePrefix = "Mode \(String(format: "%02X", mode)): \(description)"
@@ -638,6 +792,24 @@ final class OBD2Analyzer {
         if let note = lengthByteNote { details.append(note) }
         details.append("Hex: \(hexBytes)")
         details.append("ASCII: \(ascii)")
+
+        if isOBD2, Self.obd2DTCModes.contains(mode) {
+            let (headline, dtcLines) = self.obd2DTCDetails(mode: mode, payload: Array(bytes.dropFirst()))
+            details.append(contentsOf: dtcLines)
+            return AnalyzerOutput(headline: headline, details: details)
+        }
+
+        if !isOBD2, mode == 0x19 {
+            let dtcLines = self.udsReadDTCDetails(bytes: bytes)
+            if !dtcLines.isEmpty {
+                if let description = modeDescriptions[mode] {
+                    let subParts = self.describeUDSSubParameters(mode: mode, bytes: bytes)
+                    details.append((["Mode 19: \(description)"] + subParts).joined(separator: " · "))
+                }
+                details.append(contentsOf: dtcLines)
+                return AnalyzerOutput(headline: "UDS Read DTC information", details: details)
+            }
+        }
 
         if isOBD2, let info = self.pidDatabase[pid], let formatted = info.formatter(payload) {
             let headline = "\(protocolName) response (mode \(String(format: "%02X", mode)))"
