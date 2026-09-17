@@ -89,6 +89,7 @@ struct TerminalConfiguration {
     let useTUI: Bool
     /// Commands sent automatically right after connecting (from `--init`).
     let initCommands: [String]
+    var responseTimeout: TimeInterval = 5
 }
 
 /// Supported command terminators for the REPL.

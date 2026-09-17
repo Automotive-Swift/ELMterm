@@ -45,15 +45,15 @@ final class TerminalController: NSObject {
 
     /// Half-duplex command pump: one command in flight, the rest queued until
     /// the adapter's `>` prompt releases the next. Guards every field below.
-    private static let commandWatchdogTimeout: TimeInterval = 5.0
     private let commandLock = NSLock()
     private var commandQueue: [(command: String, interactive: Bool)] = []
     private var inFlightCommand: String?
     private var commandWatchdog: DispatchSourceTimer?
+    private var commandWatchdogID: UUID?
     private let commandWatchdogQueue = DispatchQueue(label: "ELMterm.command.watchdog")
     /// Resumed once the command queue fully drains; lets one-shot batch mode
     /// wait for every command's response before exiting. Guarded by commandLock.
-    private var drainContinuation: CheckedContinuation<Void, Never>?
+    private var drainContinuation: CheckedContinuation<Void, Error>?
 
     private var pendingShutdown = false
     private var streamsScheduledOnRunLoop = false
@@ -174,9 +174,19 @@ final class TerminalController: NSObject {
         self.outputStream = output
         self.configureStreams()
 
+        defer {
+            _ = self.outputQueue.sync { fflush(stdout) }
+            self.cleanupStreams()
+        }
+
         let batch = self.configuration.initCommands + commands
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.commandLock.lock()
+            guard !self.pendingShutdown else {
+                self.commandLock.unlock()
+                continuation.resume(throwing: BatchError.interrupted("Connection stopped before sending commands."))
+                return
+            }
             self.drainContinuation = continuation
             // Queue the whole batch atomically before pumping so a fast
             // prompt can't drain the queue between enqueues and resume early.
@@ -186,11 +196,6 @@ final class TerminalController: NSObject {
             self.commandLock.unlock()
             self.pumpNextCommand()
         }
-
-        // Output is emitted asynchronously; drain the queue so the last
-        // response's lines reach stdout before the process exits.
-        self.outputQueue.sync { fflush(stdout) }
-        self.cleanupStreams()
     }
 
     private func enqueueInitCommands() {
@@ -249,13 +254,8 @@ final class TerminalController: NSObject {
         }
         self.keepRunning = false
         self.periodicScheduler.removeAll()
-        self.clearCommandQueue()
+        self.clearCommandQueue(reason: reason ?? "Interrupted")
         self.cleanupStreams()
-    }
-
-    func report(error: Error) {
-        let color = self.colorPalette.error
-        self.emitLine("\(color)Error: \(error.localizedDescription)\(self.colorPalette.reset)")
     }
 
     private func readUserInput() throws -> String {
@@ -642,7 +642,7 @@ final class TerminalController: NSObject {
         }
 
         self.periodicScheduler.removeAll()
-        self.clearCommandQueue()
+        self.clearCommandQueue(reason: "Session ended")
         self.persistHistory()
         self.keepRunning = false
     }
@@ -790,7 +790,7 @@ final class TerminalController: NSObject {
             let continuation = self.drainContinuation
             self.drainContinuation = nil
             self.commandLock.unlock()
-            continuation?.resume()
+            continuation?.resume(throwing: BatchError.interrupted("Connection is not open."))
             return
         }
         let next = self.commandQueue.removeFirst()
@@ -813,7 +813,7 @@ final class TerminalController: NSObject {
         self.pumpNextCommand()
     }
 
-    private func clearCommandQueue() {
+    private func clearCommandQueue(reason: String) {
         self.commandLock.lock()
         self.commandQueue.removeAll()
         self.inFlightCommand = nil
@@ -822,7 +822,7 @@ final class TerminalController: NSObject {
         let continuation = self.drainContinuation
         self.drainContinuation = nil
         self.commandLock.unlock()
-        continuation?.resume()
+        continuation?.resume(throwing: BatchError.interrupted(reason))
     }
 
     /// Drop queued periodic commands so a stopped task can't fire once more.
@@ -834,10 +834,12 @@ final class TerminalController: NSObject {
 
     private func startCommandWatchdogLocked() {
         self.cancelCommandWatchdogLocked()
+        let watchdogID = UUID()
+        self.commandWatchdogID = watchdogID
         let timer = DispatchSource.makeTimerSource(queue: self.commandWatchdogQueue)
-        timer.schedule(deadline: .now() + Self.commandWatchdogTimeout)
+        timer.schedule(deadline: .now() + self.configuration.responseTimeout)
         timer.setEventHandler { [weak self] in
-            self?.handleCommandWatchdog()
+            self?.handleCommandWatchdog(id: watchdogID)
         }
         self.commandWatchdog = timer
         timer.resume()
@@ -846,14 +848,29 @@ final class TerminalController: NSObject {
     private func cancelCommandWatchdogLocked() {
         self.commandWatchdog?.cancel()
         self.commandWatchdog = nil
+        self.commandWatchdogID = nil
     }
 
-    private func handleCommandWatchdog() {
+    private func handleCommandWatchdog(id: UUID) {
         self.commandLock.lock()
+        guard self.commandWatchdogID == id, let command = self.inFlightCommand else {
+            self.commandLock.unlock()
+            return
+        }
         self.inFlightCommand = nil
         self.cancelCommandWatchdogLocked()
+        let continuation = self.drainContinuation
+        if continuation != nil {
+            self.commandQueue.removeAll()
+            self.drainContinuation = nil
+        }
         self.commandLock.unlock()
-        self.pumpNextCommand()
+        if let continuation {
+            continuation.resume(throwing: BatchError.responseTimeout(command))
+        } else {
+            self.printStatus("Response timed out for '\(command)'; command queue resumed.")
+            self.pumpNextCommand()
+        }
     }
 
     private func writeCommand(_ line: String) {
@@ -894,7 +911,14 @@ final class TerminalController: NSObject {
     }
 
     private func printStatus(_ line: String) {
-        self.printDirectional(direction: .status, body: line)
+        if isatty(STDOUT_FILENO) == 0 {
+            self.outputQueue.async {
+                fputs("\(line)\n", stderr)
+                fflush(stderr)
+            }
+        } else {
+            self.printDirectional(direction: .status, body: line)
+        }
     }
 
     private func printDirectional(direction: OutputDirection, body: String) {

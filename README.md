@@ -131,6 +131,12 @@ A K-Line VIN, returned line-by-line, is reassembled on the prompt:
 ```bash
 brew tap mickeyl/formulae
 brew install elmterm
+
+# Upgrade an existing installation
+brew update && brew upgrade elmterm
+
+# Uninstall
+brew uninstall elmterm
 ```
 
 ### Prerequisites
@@ -142,7 +148,7 @@ brew install elmterm
 ### Building
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Automotive-Swift/ELMterm.git
 cd ELMterm
 swift build -c release
 ```
@@ -171,6 +177,9 @@ ARGUMENTS:
 
 OPTIONS:
   -t, --timeout <seconds> Connection timeout (default 12s)
+  --response-timeout <s> Wait at most this long for each adapter prompt (default 5s)
+  --no-color             Disable ANSI colors (also honors NO_COLOR and TERM=dumb)
+  --version              Print the ELMterm version
   -p, --prompt <text>     Prompt shown in the REPL (default "> ")
   --terminator <mode>     Append CR/LF/CRLF/none/hex:... or literal text to every command
   --history <path>        Persist command history at this path (default ~/.elmterm.history)
@@ -189,7 +198,8 @@ OPTIONS:
 
 ANSI colors are emitted only when stdout is a terminal, so piping or
 redirecting ELMterm produces clean plain-text output (annotations are kept;
-use `--plain` to drop them too).
+use `--plain` to drop them too). Use `--no-color`, a non-empty `NO_COLOR`,
+or `TERM=dumb` to disable colors in a terminal as well.
 
 ### Startup Scripts & One-Shot Mode
 
@@ -217,6 +227,14 @@ $ ELMterm tcp://192.168.0.10:35000 --init ~/elm-setup.txt --exec 0902
 # Chain several requests
 $ ELMterm tcp://192.168.0.10:35000 --exec 0100 --exec 0902 --exec 010C
 ```
+
+Batch mode exits nonzero on connection failure, response timeout, interruption,
+or disconnect before all responses complete. Remaining commands are not sent
+after a batch timeout. Increase `--response-timeout` for slow adapters or protocol
+searches, e.g. `--response-timeout 30`. A received adapter prompt completes the
+exchange; ECU negative responses and `NO DATA` remain diagnostic output rather
+than process failures. When redirected, status messages go to stderr; stdout
+contains transmitted commands, received lines, and optional annotations.
 
 ### Configuration & Theming
 
@@ -274,7 +292,7 @@ Stopped periodic task #1.
 Stopped all periodic tasks.
 ```
 
-Intervals accept `ms`, `s`, `m`, or a bare number (seconds). Multiple tasks run
+Intervals accept `ms`, `s`, `m`, or a bare number (seconds), from 50ms to 24h. Multiple tasks run
 concurrently; all transmissions are serialized through the half-duplex command
 pump, so each response is fully received before the next command is sent.
 Periodic ticks also yield briefly to interactive input, so typing a command by
@@ -450,3 +468,16 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - [ELM327 Datasheet](https://www.elmelectronics.com/wp-content/uploads/2016/07/ELM327DS.pdf)
 - [ISO 14229-1 UDS Specification](https://www.iso.org/standard/72439.html)
 - [SAE J1979 OBD-II Standard](https://www.sae.org/standards/content/j1979_202104/)
+
+## Validation
+
+```bash
+swift build
+swift test
+python3 -m unittest discover -s Tests/Integration -v
+swift build -c release
+ELMTERM_BINARY=.build/release/ELMterm python3 -m unittest discover -s Tests/Integration -v
+```
+
+The TCP tests use local mock adapters and cover command ordering, startup files,
+timeouts, disconnects, interrupts, and connection failures without vehicle hardware.

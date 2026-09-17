@@ -78,16 +78,18 @@ final class PeriodicScheduler {
     static func parseInterval(_ text: String) -> TimeInterval? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !trimmed.isEmpty else { return nil }
+        let interval: TimeInterval?
         if trimmed.hasSuffix("ms") {
-            return Double(trimmed.dropLast(2)).map { $0 / 1000.0 }
+            interval = Double(trimmed.dropLast(2)).map { $0 / 1000.0 }
+        } else if trimmed.hasSuffix("s") {
+            interval = Double(trimmed.dropLast())
+        } else if trimmed.hasSuffix("m") {
+            interval = Double(trimmed.dropLast()).map { $0 * 60.0 }
+        } else {
+            interval = Double(trimmed)
         }
-        if trimmed.hasSuffix("s") {
-            return Double(trimmed.dropLast())
-        }
-        if trimmed.hasSuffix("m") {
-            return Double(trimmed.dropLast()).map { $0 * 60.0 }
-        }
-        return Double(trimmed)
+        guard let interval, interval.isFinite, interval > 0, interval <= 86400 else { return nil }
+        return interval
     }
 
     static func describe(_ interval: TimeInterval) -> String {

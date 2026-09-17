@@ -113,8 +113,8 @@ final class OBD2Analyzer {
         }),
         0x0C: .init(description: "Engine RPM", formatter: { bytes in
             guard bytes.count >= 2 else { return nil }
-            let value = (Int(bytes[0]) << 8 | Int(bytes[1])) / 4
-            return "\(value) rpm"
+            let value = Double(Int(bytes[0]) << 8 | Int(bytes[1])) / 4.0
+            return String(format: "%.2f rpm", value)
         }),
         0x0D: .init(description: "Vehicle speed", formatter: { bytes in
             guard let a = bytes.first else { return nil }
@@ -811,7 +811,7 @@ final class OBD2Analyzer {
             }
         }
 
-        if isOBD2, let info = self.pidDatabase[pid], let formatted = info.formatter(payload) {
+        if mode == 0x01, let info = self.pidDatabase[pid], let formatted = info.formatter(payload) {
             let headline = "\(protocolName) response (mode \(String(format: "%02X", mode)))"
             details.append("\(info.description): \(formatted)")
             return AnalyzerOutput(headline: headline, details: details)

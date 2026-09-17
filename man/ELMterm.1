@@ -1,4 +1,4 @@
-.Dd February 9, 2026
+.Dd September 17, 2026
 .Dt ELMTERM 1
 .Os
 .Sh NAME
@@ -8,6 +8,8 @@
 .Nm
 .Ar url-string
 .Op Fl -timeout Ar seconds
+.Op Fl -response-timeout Ar seconds
+.Op Fl -no-color
 .Op Fl -prompt Ar text
 .Op Fl -terminator Ar mode
 .Op Fl -history Ar path
@@ -37,6 +39,13 @@ or
 .Bl -tag -width Ds
 .It Fl -timeout Ar seconds
 Connection timeout. Default: 12.
+.It Fl -response-timeout Ar seconds
+Maximum wait for each adapter prompt. Default: 5 seconds.
+Batch mode fails on timeout and does not send remaining commands.
+.It Fl -no-color
+Disable ANSI colors. Also honors non-empty NO_COLOR and TERM=dumb.
+.It Fl -version
+Print the program version.
 .It Fl -prompt Ar text
 Prompt shown in interactive mode. Default:
 .Dq > .
@@ -86,6 +95,11 @@ standard output is a terminal.
 .It Fl h , Fl -help
 Show help output.
 .El
+.Sh EXIT STATUS
+Batch mode exits zero when all adapter prompts arrive. Connection errors,
+response timeouts, interruptions, and premature disconnects exit nonzero.
+ECU negative responses and NO DATA remain diagnostic output.
+When redirected, status messages go to standard error.
 .Sh META COMMANDS
 Inside the REPL, meta commands start with a colon:
 .Bl -tag -width Ds

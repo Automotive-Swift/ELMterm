@@ -8,7 +8,8 @@ struct ELMterm: AsyncParsableCommand {
 
     static let configuration: CommandConfiguration = .init(
         commandName: "ELMterm",
-        abstract: "A transport-agnostic terminal for ELM-compatible OBD-II adapters."
+        abstract: "A transport-agnostic terminal for ELM-compatible OBD-II adapters.",
+        version: "1.2.0"
     )
 
     @Argument(help: "CornucopiaStreams URL, e.g. tcp://192.168.0.10:35000 or tty:///dev/tty.usbserial-XXXX.")
@@ -16,6 +17,12 @@ struct ELMterm: AsyncParsableCommand {
 
     @Option(name: [.customShort("t"), .long], help: "Connection timeout in seconds.")
     var timeout: Double = 12
+
+    @Option(name: .long, help: "Maximum seconds to wait for an adapter response.")
+    var responseTimeout: Double = 5
+
+    @Flag(name: .long, help: "Disable ANSI colors.")
+    var noColor: Bool = false
 
     @Option(name: [.customShort("p"), .long], help: "Prompt shown in the REPL.")
     var prompt: String = "> "
@@ -26,8 +33,8 @@ struct ELMterm: AsyncParsableCommand {
     @Option(name: .long, help: "Persist history at the provided path (default: ~/.elmterm.history when omitted).")
     var history: String?
 
-    @Option(name: .long, help: "Maximum number of commands kept in history.")
-    var historyDepth: Int = 500
+    @Option(name: .long, help: "Maximum number of commands kept in history (default: 500).")
+    var historyDepth: Int?
 
     @Option(name: .long, help: "Path to a JSON config file (default: ~/.elmterm.json when present).")
     var config: String?
@@ -56,6 +63,21 @@ struct ELMterm: AsyncParsableCommand {
     @Option(name: .long, help: "Send a command, then exit once its response arrives. Repeatable; implies non-interactive mode.")
     var exec: [String] = []
 
+    mutating func validate() throws {
+        guard self.timeout.isFinite, self.timeout > 0, self.timeout <= 86400 else {
+            throw ValidationError("--timeout must be greater than zero and at most 86400 seconds.")
+        }
+        guard self.responseTimeout.isFinite, self.responseTimeout > 0, self.responseTimeout <= 86400 else {
+            throw ValidationError("--response-timeout must be greater than zero and at most 86400 seconds.")
+        }
+        if let historyDepth = self.historyDepth, historyDepth < 0 {
+            throw ValidationError("--history-depth must be zero or greater.")
+        }
+        guard self.exec.allSatisfy({ !$0.trimmed.isEmpty && !$0.contains("\r") && !$0.contains("\n") }) else {
+            throw ValidationError("Each --exec must contain one non-empty command without line breaks.")
+        }
+    }
+
     mutating func run() async throws {
 
         guard let endpoint = URL(string: self.urlString) else {
@@ -68,9 +90,15 @@ struct ELMterm: AsyncParsableCommand {
         let effectiveTheme = self.theme ?? preferences.theme ?? .light
         // Colour only when stdout is a real terminal, so piped or redirected
         // output stays clean text.
-        let palette = isatty(STDOUT_FILENO) != 0 ? ColorPalette.palette(for: effectiveTheme) : .plain
+        let environment = ProcessInfo.processInfo.environment
+        let useColor = isatty(STDOUT_FILENO) != 0 && !self.noColor
+            && (environment["NO_COLOR"] ?? "").isEmpty && environment["TERM"] != "dumb"
+        let palette = useColor ? ColorPalette.palette(for: effectiveTheme) : .plain
         let historyURL = Self.makeHistoryURL(from: self.history ?? preferences.historyPath)
-        let historyDepth = preferences.historyDepth ?? self.historyDepth
+        let historyDepth = self.historyDepth ?? preferences.historyDepth ?? 500
+        guard historyDepth >= 0 else {
+            throw ValidationError("Configured historyDepth must be zero or greater.")
+        }
 
         let logFileURL: URL? = self.log.map { path in
             URL(fileURLWithPath: Self.expandPath(path)).standardizedFileURL
@@ -90,33 +118,28 @@ struct ELMterm: AsyncParsableCommand {
             colorPalette: palette,
             logFileURL: logFileURL,
             useTUI: !self.noTui && !isOneShot,
-            initCommands: initCommands
+            initCommands: initCommands,
+            responseTimeout: self.responseTimeout
         )
 
         let controller = TerminalController(configuration: configuration, analyzer: self.plain ? nil : OBD2Analyzer())
-        let runLoopStopper = RunLoopStopper()
         let signalHandler = SignalForwarder {
             controller.requestStop(reason: "Interrupted")
         }
         signalHandler.activate()
+        defer { withExtendedLifetime(signalHandler) {} }
         let connectTimeout = self.timeout
         let execCommands = self.exec
 
+        // The line editor performs blocking reads. Keep it off the main queue,
+        // which the async runtime uses to deliver Foundation stream events.
         let replTask = Task.detached(priority: .userInitiated) {
-            do {
-                if isOneShot {
-                    try await controller.runBatch(url: endpoint, timeout: connectTimeout, commands: execCommands)
-                } else {
-                    try await controller.start(url: endpoint, timeout: connectTimeout)
-                }
-            } catch {
-                controller.report(error: error)
-                throw error
+            if isOneShot {
+                try await controller.runBatch(url: endpoint, timeout: connectTimeout, commands: execCommands)
+            } else {
+                try await controller.start(url: endpoint, timeout: connectTimeout)
             }
-            runLoopStopper.stop()
         }
-
-        runLoopStopper.run()
 
         switch await replTask.result {
             case .success:
@@ -137,8 +160,8 @@ struct ELMterm: AsyncParsableCommand {
             throw ValidationError("Unable to read command file \(expanded): \(error.localizedDescription)")
         }
         return content
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 

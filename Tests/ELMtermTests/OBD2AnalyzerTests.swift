@@ -40,6 +40,38 @@ final class OBD2AnalyzerTests: XCTestCase {
         XCTAssertTrue(analyzer.finalizeReassembly().isEmpty)
     }
 
+    func test_livePIDs_decodeEngineeringUnits() {
+        let cases = [
+            ("41 0C 1A F9", "Engine RPM: 1726.25 rpm"),
+            ("41 05 7B", "Engine coolant temperature: 83 °C"),
+            ("41 42 36 B0", "Control module voltage: 14.000 V"),
+            ("41 10 01 F4", "MAF air flow rate: 5.00 g/s"),
+        ]
+        for (frame, expected) in cases {
+            let output = OBD2Analyzer().annotateIncoming(frame)
+            XCTAssertTrue(output?.details.contains(expected) == true, "\(frame): \(String(describing: output))")
+        }
+    }
+
+    func test_livePIDs_truncatedPayloadDoesNotInventValue() {
+        let output = OBD2Analyzer().annotateIncoming("41 0C 1A")
+        XCTAssertFalse(output?.details.contains(where: { $0.contains("rpm") }) == true)
+    }
+
+    func test_otherModes_doNotUseMode01PIDLayout() {
+        for frame in ["42 0C 00 1A F8", "49 05 01"] {
+            let output = OBD2Analyzer().annotateIncoming(frame)
+            XCTAssertFalse(output?.details.contains(where: { $0.contains("rpm") || $0.contains("°C") }) == true)
+        }
+    }
+
+    func test_isotp_sequenceErrorDiscardsIncompleteMessage() {
+        let analyzer = OBD2Analyzer()
+        _ = analyzer.annotateIncoming("7E8 10 14 49 02 01 57 41 55")
+        XCTAssertEqual(analyzer.annotateIncoming("7E8 22 5A 5A 5A 38 54 38 42")?.headline, "⚠️ ISO-TP Sequence Error")
+        XCTAssertEqual(analyzer.annotateIncoming("7E8 21 5A 5A 5A 38 54 38 42")?.headline, "⚠️ ISO-TP Consecutive Frame (orphaned)")
+    }
+
     // MARK: - DTC decoding
 
     func test_dtcDecoder_obd2TwoByteCode() {

@@ -3,23 +3,6 @@ import CELMtermShim
 import CornucopiaStreams
 import Foundation
 
-final class RunLoopStopper {
-
-    private let runLoop = RunLoop.main
-
-    func run() {
-        self.runLoop.run()
-    }
-
-    func stop() {
-        DispatchQueue.main.async {
-            CFRunLoopStop(CFRunLoopGetMain())
-        }
-    }
-}
-
-extension RunLoopStopper: @unchecked Sendable {}
-
 final class SignalForwarder {
 
     private let handler: () -> Void
