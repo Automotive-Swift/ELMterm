@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-09-25
 
 - Annotate requests with the inferred CAN frame the adapter transmits as `On the bus (inferred): 7DF 02 01 00` (header, PCI, payload; no padding; independent of `ATH`), based on tracked protocol, header, priority, auto-formatting and extended-address settings. Omitted whenever the protocol is not known to be ISO 15765-4 or the request needs more than one frame. While the protocol is still unknown, the first request shows a one-time hint to query it with `ATDPN`.
 - Keep tracking adapter state while annotations are toggled off with `:analyzer off`.

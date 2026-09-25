@@ -9,7 +9,7 @@ struct ELMterm: AsyncParsableCommand {
     static let configuration: CommandConfiguration = .init(
         commandName: "ELMterm",
         abstract: "A transport-agnostic terminal for ELM-compatible OBD-II adapters.",
-        version: "1.2.0"
+        version: "1.3.0"
     )
 
     @Argument(help: "CornucopiaStreams URL, e.g. tcp://192.168.0.10:35000 or tty:///dev/tty.usbserial-XXXX.")
