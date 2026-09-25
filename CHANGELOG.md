@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix batch commands being released one step early when the adapter prints a prompt on connect (or any other stale `>`), which shifted every response onto the following command and could reorder analyzer state.
+
 ## 1.2.0 — 2026-09-17
 
 - Run startup command files with `--init` and one-shot command sequences with repeated `--exec` options.

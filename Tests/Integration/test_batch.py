@@ -12,8 +12,8 @@ BINARY = str(Path(os.environ.get("ELMTERM_BINARY", ".build/debug/ELMterm")).reso
 
 
 class BatchTests(unittest.TestCase):
-    def run_adapter(self, responses, commands=("ATI",), extra=(), interrupt=False):
-        received, errors = [], []
+    def run_adapter(self, responses, commands=("ATI",), extra=(), interrupt=False, greeting=b""):
+        received, errors, premature = [], [], []
         ready = threading.Event()
         with socket.socket() as server:
             server.bind(("127.0.0.1", 0))
@@ -26,6 +26,8 @@ class BatchTests(unittest.TestCase):
                     with server.accept()[0] as connection:
                         connection.settimeout(5)
                         pending = b""
+                        if greeting:
+                            connection.sendall(greeting)
                         for response in responses:
                             while b"\r" not in pending:
                                 chunk = connection.recv(4096)
@@ -35,6 +37,17 @@ class BatchTests(unittest.TestCase):
                             command, pending = pending.split(b"\r", 1)
                             received.append(command.decode())
                             ready.set()
+                            if greeting:
+                                # Give a client that wrongly took the greeting as a prompt time to send ahead.
+                                connection.settimeout(0.3)
+                                try:
+                                    early = connection.recv(4096)
+                                    if early:
+                                        premature.append(early.decode())
+                                        pending += early
+                                except socket.timeout:
+                                    pass
+                                connection.settimeout(5)
                             if response is None:
                                 return  # disconnect before the prompt
                             if response:
@@ -68,6 +81,7 @@ class BatchTests(unittest.TestCase):
             worker.join(5)
             self.assertFalse(worker.is_alive(), "Mock adapter did not stop")
             self.assertFalse(errors, errors)
+            self.assertFalse(premature, f"Commands sent before the prompt: {premature}")
             return process.returncode, stdout, stderr, received
 
     def test_success_waits_for_each_prompt(self):
@@ -78,6 +92,14 @@ class BatchTests(unittest.TestCase):
         self.assertIn("ELM327 v2.3", out)
         self.assertIn("41 0C 1A F8", out)
         self.assertNotIn("\x1b", out)
+
+    def test_prompt_on_connect_does_not_release_next_command(self):
+        code, out, err, commands = self.run_adapter(
+            [b"ATI\rELM327 v2.3\r\r>", b"010C\r41 0C 1A F8\r\r>"], ("ATI", "010C"), greeting=b">")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(commands, ["ATI", "010C"])
+        lines = [line for line in out.splitlines() if line in ("ATI", "ELM327 v2.3", "010C", "41 0C 1A F8")]
+        self.assertEqual(lines, ["ATI", "ELM327 v2.3", "010C", "41 0C 1A F8"])
 
     def test_timeout_fails_and_does_not_send_remaining_commands(self):
         code, out, err, commands = self.run_adapter([b""], ("ATI", "010C"))

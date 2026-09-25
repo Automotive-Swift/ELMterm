@@ -9,6 +9,8 @@ final class TerminalController: NSObject {
     private let configuration: TerminalConfiguration
     private let colorPalette: ColorPalette
     private var analyzer: OBD2Analyzer?
+    /// The analyzer is fed from the stream thread (responses) and whichever thread pumps a command.
+    private let analyzerLock = NSLock()
     private var keepRunning = true
     private var annotationEnabled: Bool
 
@@ -48,6 +50,10 @@ final class TerminalController: NSObject {
     private let commandLock = NSLock()
     private var commandQueue: [(command: String, interactive: Bool)] = []
     private var inFlightCommand: String?
+    /// A prompt only completes the in-flight command if the adapter sent something before it.
+    /// A bare `>` is stale — some adapters print one on connect — and honoring it would release
+    /// the next command early, shifting every later response by one.
+    private var responseBytesSinceSend = false
     private var commandWatchdog: DispatchSourceTimer?
     private var commandWatchdogID: UUID?
     private let commandWatchdogQueue = DispatchQueue(label: "ELMterm.command.watchdog")
@@ -795,10 +801,25 @@ final class TerminalController: NSObject {
         }
         let next = self.commandQueue.removeFirst()
         self.inFlightCommand = next.command
+        self.responseBytesSinceSend = false
         self.startCommandWatchdogLocked()
         self.commandLock.unlock()
 
         self.writeCommand(next.command)
+    }
+
+    private func noteResponseBytesReceived() {
+        self.commandLock.lock()
+        self.responseBytesSinceSend = true
+        self.commandLock.unlock()
+    }
+
+    private func consumeResponseBytesSinceSend() -> Bool {
+        self.commandLock.lock()
+        defer { self.commandLock.unlock() }
+        let received = self.responseBytesSinceSend
+        self.responseBytesSinceSend = false
+        return received
     }
 
     /// Called when the adapter emits its `>` prompt, signalling that the
@@ -883,7 +904,7 @@ final class TerminalController: NSObject {
         let payload = line.appendingTerminator(self.configuration.terminator.bytes)
         self.printOutgoing(line)
         self.communicationLogger?.log(direction: .tx, message: line)
-        if self.annotationEnabled, let annotation = self.analyzer?.annotateOutgoing(line) {
+        if self.annotationEnabled, let annotation = self.withAnalyzer({ $0.annotateOutgoing(line) }) {
             self.printAnnotation(annotation, direction: .outgoing)
         }
 
@@ -1098,9 +1119,13 @@ final class TerminalController: NSObject {
 
         while !self.incomingBuffer.isEmpty {
             // The ELM327 prompt indicates end of a response. Swallow all leading prompt characters.
-            while !self.incomingBuffer.isEmpty && self.incomingBuffer.first == promptByte {
-                self.incomingBuffer.removeFirst()
-                sawPrompt = true
+            if self.incomingBuffer.first == promptByte {
+                while !self.incomingBuffer.isEmpty && self.incomingBuffer.first == promptByte {
+                    self.incomingBuffer.removeFirst()
+                }
+                if self.consumeResponseBytesSinceSend() {
+                    sawPrompt = true
+                }
             }
 
             guard !self.incomingBuffer.isEmpty else { break }
@@ -1120,6 +1145,7 @@ final class TerminalController: NSObject {
             }
 
             self.incomingBuffer.removeSubrange(..<lineEnd)
+            self.noteResponseBytesReceived()
 
             if !lineData.isEmpty {
                 self.emitLine(from: lineData)
@@ -1137,10 +1163,17 @@ final class TerminalController: NSObject {
     /// The prompt marks the end of a response, which is the only completion
     /// signal legacy (non-CAN) multi-line replies carry — flush them now.
     private func finalizeReassembly() {
-        guard self.annotationEnabled, let analyzer = self.analyzer else { return }
-        for annotation in analyzer.finalizeReassembly() {
+        guard self.annotationEnabled else { return }
+        for annotation in self.withAnalyzer({ $0.finalizeReassembly() }) ?? [] {
             self.printAnnotation(annotation, direction: .incoming)
         }
+    }
+
+    private func withAnalyzer<T>(_ body: (OBD2Analyzer) -> T?) -> T? {
+        guard let analyzer = self.analyzer else { return nil }
+        self.analyzerLock.lock()
+        defer { self.analyzerLock.unlock() }
+        return body(analyzer)
     }
 
     private func emitLine(from dataSlice: Data.SubSequence) {
@@ -1196,7 +1229,7 @@ final class TerminalController: NSObject {
             self.emitLines(hexLines)
         }
 
-        if self.annotationEnabled, let annotation = self.analyzer?.annotateIncoming(trimmed) {
+        if self.annotationEnabled, let annotation = self.withAnalyzer({ $0.annotateIncoming(trimmed) }) {
             self.printAnnotation(annotation, direction: .incoming)
         }
     }
