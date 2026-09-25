@@ -33,6 +33,8 @@ final class OBD2Analyzer {
     private var isotpNeedsHeaders = false
     private var configuredExtendedAddress: UInt8?
     private var adapterState = AdapterState()
+    /// Explaining the missing frame once per unknown-protocol phase is helpful; on every request it's noise.
+    private var unknownProtocolHintShown = false
 
     /// Legacy (non-CAN) multi-line OBD reassembly. K-Line/ISO 9141-2/KWP split
     /// a long mode-09 reply across several `49 PID seq <data>` lines that share
@@ -375,6 +377,12 @@ final class OBD2Analyzer {
         var details: [String] = []
         if let frame = self.adapterState.canFrame(for: bytes) {
             details.append("CAN frame (inferred): \(frame)")
+        }
+        if self.adapterState.busProtocol != nil {
+            self.unknownProtocolHintShown = false
+        } else if !self.unknownProtocolHintShown {
+            self.unknownProtocolHintShown = true
+            details.append("CAN frame unknown – protocol not determined yet (try ATDPN)")
         }
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         details.append("Hex: \(hexBytes)")
