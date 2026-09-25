@@ -120,20 +120,20 @@ final class OBD2AnalyzerTests: XCTestCase {
     func test_annotateOutgoing_afterAutoSearch_showsInferredCANFrame() {
         let analyzer = OBD2Analyzer()
 
-        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("CAN frame (inferred)") } == true)
+        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("On the bus (inferred)") } == true)
         _ = analyzer.annotateIncoming("SEARCHING...")
         _ = analyzer.annotateIncoming("41 00 BE 1F A8 13")
         _ = analyzer.annotateOutgoing("ATH1")
-        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("CAN frame (inferred)") } == true)
+        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("On the bus (inferred)") } == true)
         _ = analyzer.annotateIncoming("7E8 06 41 00 BE 1F A8 13")
 
         let output = analyzer.annotateOutgoing("0902")
-        XCTAssertEqual(output?.details.first, "CAN frame (inferred): 7DF 02 09 02")
+        XCTAssertEqual(output?.details.first, "On the bus (inferred): 7DF 02 09 02")
     }
 
     func test_annotateOutgoing_unknownProtocol_hintsOncePerUnknownPhase() {
         let analyzer = OBD2Analyzer()
-        let hint = "CAN frame unknown – protocol not determined yet (try ATDPN)"
+        let hint = "On the bus: unknown until the protocol is determined (try ATDPN)"
 
         XCTAssertEqual(analyzer.annotateOutgoing("0100")?.details.first, hint)
         XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains(hint) == true)
@@ -149,6 +149,6 @@ final class OBD2AnalyzerTests: XCTestCase {
         let analyzer = OBD2Analyzer()
         _ = analyzer.annotateOutgoing("ATSP3")
 
-        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("CAN frame") } == true)
+        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("On the bus") } == true)
     }
 }

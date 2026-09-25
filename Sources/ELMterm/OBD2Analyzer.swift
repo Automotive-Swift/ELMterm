@@ -376,13 +376,13 @@ final class OBD2Analyzer {
 
         var details: [String] = []
         if let frame = self.adapterState.canFrame(for: bytes) {
-            details.append("CAN frame (inferred): \(frame)")
+            details.append("On the bus (inferred): \(frame)")
         }
         if self.adapterState.busProtocol != nil {
             self.unknownProtocolHintShown = false
         } else if !self.unknownProtocolHintShown {
             self.unknownProtocolHintShown = true
-            details.append("CAN frame unknown – protocol not determined yet (try ATDPN)")
+            details.append("On the bus: unknown until the protocol is determined (try ATDPN)")
         }
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         details.append("Hex: \(hexBytes)")
