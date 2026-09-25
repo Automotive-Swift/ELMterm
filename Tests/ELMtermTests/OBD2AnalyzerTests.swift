@@ -116,4 +116,18 @@ final class OBD2AnalyzerTests: XCTestCase {
         XCTAssertTrue(output?.details.contains { $0.hasPrefix("P0171-00 — System Too Lean (Bank 1)") && $0.contains("testFailed, confirmed") } == true)
         XCTAssertTrue(output?.details.contains { $0.hasPrefix("P0133-00") && $0.contains("confirmed") } == true)
     }
+
+    func test_annotateOutgoing_afterAutoSearch_showsInferredCANFrame() {
+        let analyzer = OBD2Analyzer()
+
+        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("CAN frame") } == true)
+        _ = analyzer.annotateIncoming("SEARCHING...")
+        _ = analyzer.annotateIncoming("41 00 BE 1F A8 13")
+        _ = analyzer.annotateOutgoing("ATH1")
+        XCTAssertFalse(analyzer.annotateOutgoing("0100")?.details.contains { $0.hasPrefix("CAN frame") } == true)
+        _ = analyzer.annotateIncoming("7E8 06 41 00 BE 1F A8 13")
+
+        let output = analyzer.annotateOutgoing("0902")
+        XCTAssertEqual(output?.details.first, "CAN frame (inferred): 7DF 02 09 02")
+    }
 }

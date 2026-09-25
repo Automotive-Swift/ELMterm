@@ -32,6 +32,7 @@ final class OBD2Analyzer {
     private var isotpStates: [ISOTPKey: ISOTPReassembly] = [:]
     private var isotpNeedsHeaders = false
     private var configuredExtendedAddress: UInt8?
+    private var adapterState = AdapterState()
 
     /// Legacy (non-CAN) multi-line OBD reassembly. K-Line/ISO 9141-2/KWP split
     /// a long mode-09 reply across several `49 PID seq <data>` lines that share
@@ -340,6 +341,7 @@ final class OBD2Analyzer {
 
         let upper = line.uppercased()
         self.updateAdapterState(for: upper)
+        self.adapterState.observeCommand(upper)
         if upper.hasPrefix("AT") {
             let match = self.atCommands.first { upper.hasPrefix($0.key) }
             if let (command, description) = match {
@@ -371,6 +373,9 @@ final class OBD2Analyzer {
         self.legacyFrameStates.removeAll()
 
         var details: [String] = []
+        if let frame = self.adapterState.canFrame(for: bytes) {
+            details.append("CAN frame (inferred): \(frame)")
+        }
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
         details.append("Hex: \(hexBytes)")
 
@@ -613,6 +618,7 @@ final class OBD2Analyzer {
     func annotateIncoming(_ line: String) -> AnalyzerOutput? {
 
         let upper = line.uppercased()
+        self.adapterState.observeResponse(upper)
         if upper.contains("NO DATA") {
             return AnalyzerOutput(headline: "Adapter status", details: ["No ECU replied to this request"])
         }

@@ -57,6 +57,7 @@ ELMterm **understands** automotive protocols and provides real-time intelligence
 ### Protocol Intelligence
 
 - **Real-time Protocol Annotation**: Every request and response is automatically analyzed and annotated with semantic meaning
+- **Inferred CAN Frames**: Requests are annotated with the frame the adapter will put on the bus (e.g. `0100` → `7DF 02 01 00`), derived from the tracked protocol (`ATSP`/`ATTP`, `ATDP`/`ATDPN`, headered replies), header (`ATSH`, `ATCP`), `ATCAF` and `ATCEA`. Padding is omitted, matching how received frames are shown. The line is only shown when the protocol is known to be ISO 15765-4 and the request fits a single frame — never guessed during automatic protocol search
 - **OBD-II vs UDS/KWP Detection**: Automatically distinguishes between OBD-II (modes 01-0F) and UDS/KWP (modes 10+) protocols
 - **ISO-TP Reassembly**: Automatically detects and reassembles multi-frame ISO 15765-2 messages with sequence validation
 - **Legacy Multi-Line Reassembly**: Reassembles segmented mode-09 replies on non-CAN links (K-Line/ISO 9141-2, KWP) where each `49 PID seq …` line carries a slice and the adapter prompt marks completion
@@ -421,6 +422,7 @@ ELMterm/
 │   │   ├── ELMterm.swift            # @main CLI entry point (ArgumentParser)
 │   │   ├── TerminalController.swift # REPL, line editor, command pump, streams
 │   │   ├── OBD2Analyzer.swift       # OBD-II/UDS/KWP annotation + reassembly
+│   │   ├── AdapterState.swift       # Tracked adapter config → inferred CAN frames
 │   │   ├── DTCDecoder.swift         # Trouble-code decoding + descriptions
 │   │   ├── TerminalUI.swift         # Bottom-anchored TUI
 │   │   ├── PeriodicScheduler.swift  # Timer-driven periodic commands

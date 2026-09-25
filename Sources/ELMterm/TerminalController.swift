@@ -904,7 +904,7 @@ final class TerminalController: NSObject {
         let payload = line.appendingTerminator(self.configuration.terminator.bytes)
         self.printOutgoing(line)
         self.communicationLogger?.log(direction: .tx, message: line)
-        if self.annotationEnabled, let annotation = self.withAnalyzer({ $0.annotateOutgoing(line) }) {
+        if let annotation = self.withAnalyzer({ $0.annotateOutgoing(line) }) {
             self.printAnnotation(annotation, direction: .outgoing)
         }
 
@@ -1163,7 +1163,6 @@ final class TerminalController: NSObject {
     /// The prompt marks the end of a response, which is the only completion
     /// signal legacy (non-CAN) multi-line replies carry — flush them now.
     private func finalizeReassembly() {
-        guard self.annotationEnabled else { return }
         for annotation in self.withAnalyzer({ $0.finalizeReassembly() }) ?? [] {
             self.printAnnotation(annotation, direction: .incoming)
         }
@@ -1229,7 +1228,7 @@ final class TerminalController: NSObject {
             self.emitLines(hexLines)
         }
 
-        if self.annotationEnabled, let annotation = self.withAnalyzer({ $0.annotateIncoming(trimmed) }) {
+        if let annotation = self.withAnalyzer({ $0.annotateIncoming(trimmed) }) {
             self.printAnnotation(annotation, direction: .incoming)
         }
     }

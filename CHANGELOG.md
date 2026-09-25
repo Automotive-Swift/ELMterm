@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Annotate requests with the inferred CAN frame the adapter transmits (header, PCI, payload; no padding), based on tracked protocol, header, priority, auto-formatting and extended-address settings. Omitted whenever the protocol is not known to be ISO 15765-4 or the request needs more than one frame.
+- Keep tracking adapter state while annotations are toggled off with `:analyzer off`.
 - Fix batch commands being released one step early when the adapter prints a prompt on connect (or any other stale `>`), which shifted every response onto the following command and could reorder analyzer state.
 
 ## 1.2.0 — 2026-09-17
